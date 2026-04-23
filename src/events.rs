@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-Bilbycast-EULA
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Standard event catalog helpers — severity enum, category taxonomy,
 //! and structured details. The shape must match `EventPayload` on the

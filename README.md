@@ -139,5 +139,14 @@ versions:
 
 ## Licensing
 
-Proprietary. Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
-See [LICENSE](../bilbycast-manager/LICENSE) (same EULA covers this SDK).
+Dual-licensed, same as bilbycast-edge:
+
+- **AGPL-3.0-or-later** — see [`LICENSE`](LICENSE). Free for review,
+  private deployment, and any use where you're comfortable with
+  AGPL's source-disclosure obligations.
+- **Commercial licence** — see [`LICENSE.commercial`](LICENSE.commercial).
+  For OEMs, hardware integrators, and SaaS providers who need to
+  embed this SDK without AGPL's copyleft. Contact
+  `contact@bilbycast.com`.
+
+Copyright (c) 2026 Softside Tech Pty Ltd.

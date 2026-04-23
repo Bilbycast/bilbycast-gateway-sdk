@@ -1,0 +1,44 @@
+bilbycast Commercial License
+============================
+
+The code in this repository is dual-licensed:
+
+1. The open-source licence — see LICENSE (GNU Affero General Public
+   License, version 3 or later). Free to use for review, private
+   deployment, and any use where you are comfortable with AGPL's
+   source-disclosure obligations (including § 13's network-copyleft
+   for operators of modified network services).
+
+2. A commercial licence from Softside Tech Pty Ltd — for OEMs,
+   hardware integrators, SaaS providers, and other commercial users
+   who need to embed, ship, or operate bilbycast without AGPL's
+   copyleft obligations. Typical use cases:
+
+   - Integrating bilbycast-gateway-sdk into a closed-source 3rd-party
+     device gateway sidecar that you ship with your encoder / gateway
+     / appliance
+   - Operating a gateway sidecar built on this SDK as part of a SaaS
+     or managed service without releasing the source of your
+     surrounding stack under AGPL
+   - Redistributing this SDK as part of a commercial software bundle
+     under terms other than AGPL
+
+To obtain a commercial licence, or to discuss whether your use
+case needs one, please contact:
+
+    Softside Tech Pty Ltd
+    contact@bilbycast.com
+
+If you're unsure which licence fits your use case, email us — we're
+happy to help you work it out before you invest engineering time.
+
+Scope
+-----
+
+The commercial licence from Softside Tech covers the
+bilbycast-gateway-sdk source code only. Softside does not hold
+copyright in third-party Rust crates this SDK depends on (tokio,
+tokio-tungstenite, rustls, serde, etc.) and cannot relicense them.
+Those crates are distributed under their own permissive licences
+(MIT / Apache-2.0 / BSD-3-Clause / ISC — see Cargo.lock) and remain
+available under those terms in both AGPL and commercial builds.

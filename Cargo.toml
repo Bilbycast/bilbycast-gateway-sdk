@@ -2,7 +2,7 @@
 name = "bilbycast-gateway-sdk"
 version = "0.1.0"
 edition = "2021"
-license = "LicenseRef-Bilbycast-EULA"
+license = "AGPL-3.0-or-later"
 description = "SDK for building 3rd-party device gateway sidecars that integrate with bilbycast-manager"
 publish = false
 

@@ -1,0 +1,31 @@
+bilbycast-gateway-sdk
+=====================
+
+Licensed under the GNU Affero General Public License, version 3 or
+later (AGPL-3.0-or-later). See LICENSE for the full text.
+
+Alternative commercial licensing is available from Softside Tech
+Pty Ltd for OEM, hardware, and SaaS integrators who need to embed
+bilbycast-gateway-sdk without AGPL's copyleft — contact
+contact@bilbycast.com. See LICENSE.commercial.
+
+Bundled third-party components
+------------------------------
+
+| Component    | Licence                                  |
+|--------------|------------------------------------------|
+| Rust crates  | MIT / Apache-2.0 / BSD-3-Clause / ISC    |
+|              | (see Cargo.lock)                         |
+
+This SDK is pure Rust. No C libraries, no GPL components, and no
+patent-encumbered codecs are bundled or linked.
+
+Source code availability
+------------------------
+
+The complete corresponding source code is at:
+
+    https://github.com/Bilbycast/bilbycast-gateway-sdk
+
+This notice is not legal advice. Consult a qualified IP attorney
+for your specific deployment.
