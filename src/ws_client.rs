@@ -358,12 +358,23 @@ async fn handle_inbound(
 
             // Special-case `get_config`: invoke the config hook and emit
             // a `config_response` envelope. Ack with success.
+            //
+            // Emission order: ack FIRST, then config_response. The manager's
+            // `command_ack` handler unconditionally invalidates the cached
+            // config as a "next request fetches fresh data" defence; sending
+            // the ack before the config_response means that invalidation hits
+            // an empty cache (no-op), and the subsequent config_response then
+            // populates `cached_config` cleanly. Reversing the order would
+            // leave the cache cleared immediately after populating it, so
+            // `request_config`'s poll loop would never observe the fresh
+            // snapshot and would return `None` → HTTP 404 on
+            // `/api/v1/nodes/{id}/config`.
             if action_is_get_config(&action) {
                 let cfg = handler.on_config_request().await;
-                let _ = emitter.emit_config_response(cfg).await;
-                return emitter
+                let _ = emitter
                     .emit_command_ack(&command_id, Ok(serde_json::Value::Null))
                     .await;
+                return emitter.emit_config_response(cfg).await;
             }
 
             // General-purpose dispatch.
