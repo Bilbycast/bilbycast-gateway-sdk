@@ -22,6 +22,38 @@ For any device we don't control natively, the integration model is a
 that speaks the manager's WebSocket protocol on one side and the vendor's
 native API on the other.
 
+### Cardinality: one sidecar per chassis
+
+The SDK is designed around **one gateway process per vendor chassis**, even
+when a single chassis hosts multiple cards / boards / slots. The Appear X
+gateway is the reference: one sidecar polls every populated slot inside one
+chassis at the chassis HTTPS endpoint defined by `[appear_x] address`.
+
+Don't fan a single sidecar out across multiple chassis HTTPS endpoints. The
+boundary that matters for monitoring and failure isolation is the chassis,
+not the cards inside it. Reasons:
+
+- **Failure isolation.** A flaky uplink to chassis A doesn't blind monitoring
+  of chassis B if they have separate sidecars.
+- **1 node = 1 chassis** in the manager. Every dashboard widget, detail
+  page, audit row, and `cached_health` blob assumes one node = one
+  vendor unit. Multi-target sidecars would need to register multiple
+  "virtual" nodes to keep the manager's mental model intact.
+- **`gateway_target` is single-valued.** The reachability sub-status the
+  manager renders (third "Target down" dashboard state, Gateway Module
+  detail header) carries one `target_address` and one `reachable` bool.
+  Multi-target would require fanning that out into a per-target array,
+  with cascading complications in the dashboard, event pipeline, and
+  audit trail.
+- **Polling state is naturally per-chassis.** Auth cookies, JSON-RPC
+  sessions, alarm dedup, NMOS subscriptions — all of it is keyed on the
+  chassis endpoint. Sharing across chassis would force the gateway to
+  carry a per-target dispatcher with no real benefit.
+
+If a future use case demands multi-chassis aggregation, that's a v2
+protocol shape (`gateway_targets: Vec<GatewayTargetHealth>`) that ripples
+into every consumer of `gateway_target`. Out of scope today.
+
 ```
 bilbycast-manager  ←──── WSS (bilbycast gateway protocol) ────┐
                                                               │
@@ -161,6 +193,69 @@ client.run().await?;
 Events should use the standard taxonomy in
 `bilbycast_gateway_sdk::events::categories`.
 
+### Sidecars must not exit on target unreachability
+
+A sidecar's target device — encoder, gateway chassis, mixer, whatever
+— will be powered down, rebooted, taken offline for maintenance, or
+moved between subnets over its lifetime. **The sidecar process must
+ride through every one of those events without exiting.**
+
+Concretely:
+
+- **Polling loop**: the snippet above already does this — vendor API
+  errors emit a `vendor_api_error` (or vendor-specific) event and the
+  loop continues to the next tick. Don't `return Err(...)` out of the
+  task on an HTTP timeout or refused TCP — that just kills polling
+  and leaves the gateway silently degraded.
+- **Startup capability discovery (if your vendor needs it)**: if your
+  gateway runs vendor-specific discovery before steady-state polling
+  (Appear X does this to learn which JSON-RPC interfaces a given
+  firmware exposes), wrap that call in a retry loop with the same
+  cadence the SDK uses for WS reconnect. Reuse `ReconnectBackoff`
+  rather than rolling your own:
+
+  ```rust
+  use bilbycast_gateway_sdk::ReconnectBackoff;
+
+  let backoff = ReconnectBackoff::default();
+  let mut attempt: u32 = 0;
+  let caps = loop {
+      match vendor::discover(&client).await {
+          Ok(c) => break c,
+          Err(e) => {
+              attempt = attempt.saturating_add(1);
+              let delay = backoff.delay_for_attempt(attempt);
+              warn!(
+                  "Capability discovery failed (attempt {attempt}): {e:#}. \
+                   Retrying in {} s",
+                  delay.as_secs()
+              );
+              tokio::select! {
+                  _ = tokio::time::sleep(delay) => {}
+                  _ = tokio::signal::ctrl_c() => return Ok(()),
+              }
+          }
+      }
+  };
+  ```
+
+  Reference: `bilbycast-appear-x-api-gateway/src/main.rs` — the
+  capability-discovery retry block in `main()`.
+
+- **Reachability state**: once steady-state polling is running, drive
+  `Emitter::emit_health_with_target` from your reachability tracker so
+  the manager dashboard shows the third "Target down" amber state
+  during outages. See the `GatewayTargetHealth` row in §9 for the
+  exact field set, and `bilbycast-appear-x-api-gateway/src/appear_x/reachability.rs`
+  for a worked implementation with a configurable failure threshold
+  and dwell-gated `target_unreachable` / `target_recovered` events.
+
+The only acceptable reasons for a sidecar to exit are: ctrl-c / SIGTERM
+(graceful shutdown via `client.shutdown_token()`), genuinely
+unrecoverable config errors (malformed `config.toml`, missing
+required fields), or a panic / process-level fault. **"My target
+device isn't responding right now"** is not on that list.
+
 ## 5. Config and credentials
 
 A typical gateway's `config.toml`:
@@ -280,6 +375,8 @@ binary will contain only vendor-specific code.
 | `GatewayClient::shutdown_token()` | Cancel to trigger graceful shutdown. |
 | `GatewayClient::on_register(cb)` | Callback fired on first-time registration. |
 | `Emitter::emit_stats` / `emit_event` / `emit_health` | The hot-path outputs. |
+| `Emitter::emit_health_with_target` | Health heartbeat plus typed `gateway_target` sub-status (target reachability, gateway host / egress IP). Drives the manager's third "Target down" amber dashboard state and the per-driver Gateway Module header. |
+| `GatewayTargetHealth { reachable, target_address, gateway_host, gateway_egress_ip, last_successful_poll_unix, last_error_code, consecutive_failures }` | Sub-status for the above. `last_error_code` is a fixed enum (`http_timeout` \| `tcp_refused` \| `tls_handshake` \| `auth_rejected` \| `rpc_protocol_error` \| `other`) — never the verbose vendor error string. |
 | `Emitter::emit_thumbnail` | Per-flow JPEG thumbnail (base64-encoded). |
 | `GatewayEvent::critical("port_conflict", "…").with_error_code("…")` | Event builder. |
 | `CommandError::unknown_action("my_action")` | Standard `error_code = unknown_action`. |

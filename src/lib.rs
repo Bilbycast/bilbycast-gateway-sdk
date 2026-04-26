@@ -85,7 +85,7 @@ pub use auth::{
 };
 pub use config::{GatewayConfig, ReconnectBackoff};
 pub use dispatch::CommandHandler;
-pub use emit::{Emitter, OutboundFrame};
+pub use emit::{Emitter, GatewayTargetHealth, OutboundFrame};
 pub use envelope::{envelope, IncomingMessage, GATEWAY_WS_PROTOCOL_VERSION};
 pub use errors::{CommandError, SdkError};
 pub use events::{categories, EventSeverity, GatewayEvent};

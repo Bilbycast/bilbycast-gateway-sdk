@@ -7,11 +7,44 @@
 //! Clone it freely — all clones share the same channel.
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::errors::{CommandError, SdkError};
 use crate::events::GatewayEvent;
+
+/// Sub-status a gateway sidecar reports on every health heartbeat.
+///
+/// The manager surfaces this on the dashboard (third "Target down" amber
+/// state when `reachable == false`) and on the per-driver detail page
+/// (Gateway Module header). Send via [`Emitter::emit_health_with_target`].
+///
+/// `last_error_code` is a fixed enum string, NOT free-text. The verbose
+/// vendor error message stays in the gateway's local event log — keeping
+/// it off the wire avoids vendor URLs / credential hints fanning out into
+/// the manager's `cached_health` (DashMap) and dashboard broadcast. Use
+/// codes like:
+/// `"http_timeout" | "tcp_refused" | "tls_handshake" | "auth_rejected"`
+/// `| "rpc_protocol_error" | "other"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayTargetHealth {
+    pub reachable: bool,
+    /// Address the gateway is configured to poll (IP or hostname).
+    pub target_address: String,
+    /// Sidecar's own hostname — what the operator can SSH to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_host: Option<String>,
+    /// Best-effort egress IP detected by the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_egress_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_poll_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_failures: Option<u32>,
+}
 
 /// Outbound WS message queued for the write task.
 ///
@@ -52,6 +85,29 @@ impl Emitter {
     /// for you — use this only for ad-hoc updates that shouldn't wait for
     /// the next tick).
     pub async fn emit_health(&self, health: Value) -> Result<(), SdkError> {
+        self.send_envelope("health", health).await
+    }
+
+    /// Emit a health envelope with a typed [`GatewayTargetHealth`] sub-status
+    /// merged in under the `gateway_target` key. Use this from a gateway
+    /// sidecar's polling loop so the manager can render the third
+    /// "Target down" state on the dashboard and surface the gateway's
+    /// own host / IP on the per-driver detail page.
+    ///
+    /// `health` is expected to be a JSON object — the typed sub-status is
+    /// inserted as a sibling field. If `health` is not an object, the
+    /// envelope is sent unchanged (the manager treats absent
+    /// `gateway_target` as legacy).
+    pub async fn emit_health_with_target(
+        &self,
+        mut health: Value,
+        target: GatewayTargetHealth,
+    ) -> Result<(), SdkError> {
+        if let Some(obj) = health.as_object_mut() {
+            let target_value = serde_json::to_value(&target)
+                .map_err(|e| SdkError::Channel(e.to_string()))?;
+            obj.insert("gateway_target".into(), target_value);
+        }
         self.send_envelope("health", health).await
     }
 
