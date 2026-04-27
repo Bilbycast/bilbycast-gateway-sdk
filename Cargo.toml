@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-gateway-sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "SDK for building 3rd-party device gateway sidecars that integrate with bilbycast-manager"

@@ -153,6 +153,18 @@ impl GatewayConfig {
                 "either (node_id + node_secret) or registration_token must be set".into(),
             ));
         }
+        // Heartbeat interval bounds — defends the manager against a
+        // misconfigured gateway spamming health envelopes (which would
+        // crowd out other nodes on the same instance).
+        let hb_secs = self.heartbeat_interval.as_secs();
+        if hb_secs < 5 || hb_secs > 300 {
+            return Err(SdkError::Config(format!(
+                "heartbeat_interval must be 5..=300 seconds (got {hb_secs}s). \
+                 Shorter intervals risk overwhelming the manager's per-node \
+                 event budget; longer intervals make node health detection \
+                 too coarse for operator dashboards."
+            )));
+        }
         Ok(())
     }
 
@@ -208,5 +220,58 @@ mod serde_duration_secs {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let secs = u64::deserialize(d)?;
         Ok(Duration::from_secs(secs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg() -> GatewayConfig {
+        GatewayConfig::minimal("wss://manager.example.com", "test", "0.0.1")
+            .with_registration_token("rt-123")
+    }
+
+    impl GatewayConfig {
+        // Helper for tests to set the registration token in one call.
+        fn with_registration_token(mut self, token: &str) -> Self {
+            self.registration_token = Some(token.into());
+            self
+        }
+    }
+
+    #[test]
+    fn heartbeat_default_is_in_bounds() {
+        let cfg = base_cfg();
+        assert!(cfg.validate().is_ok(), "default 15 s heartbeat must validate");
+    }
+
+    #[test]
+    fn heartbeat_too_small_rejected() {
+        let mut cfg = base_cfg();
+        cfg.heartbeat_interval = Duration::from_secs(0);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("5..=300"), "got: {err}");
+        cfg.heartbeat_interval = Duration::from_secs(4);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_too_large_rejected() {
+        let mut cfg = base_cfg();
+        cfg.heartbeat_interval = Duration::from_secs(301);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("5..=300"), "got: {err}");
+        cfg.heartbeat_interval = Duration::from_secs(3600);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_at_boundaries_accepted() {
+        let mut cfg = base_cfg();
+        cfg.heartbeat_interval = Duration::from_secs(5);
+        assert!(cfg.validate().is_ok());
+        cfg.heartbeat_interval = Duration::from_secs(300);
+        assert!(cfg.validate().is_ok());
     }
 }
