@@ -61,7 +61,11 @@ pub struct Emitter {
 }
 
 impl Emitter {
-    pub(crate) fn new(tx: mpsc::Sender<OutboundFrame>) -> Self {
+    /// Construct an emitter directly from a channel sender. Used by the SDK
+    /// itself; vendor code obtains an `Emitter` via [`crate::GatewayClient::emitter`].
+    /// Public for integration testing.
+    #[doc(hidden)]
+    pub fn new(tx: mpsc::Sender<OutboundFrame>) -> Self {
         Self { tx }
     }
 
@@ -177,6 +181,74 @@ impl Emitter {
     /// task already handles this transparently; exposed for completeness.
     pub async fn emit_pong(&self) -> Result<(), SdkError> {
         self.send_envelope("pong", Value::Null).await
+    }
+
+    // ── HTTP-proxy frames (web-ui-proxy capability) ──
+    //
+    // These three emit methods are used by the SDK's built-in proxy
+    // dispatcher (`proxy.rs`). Vendor sidecars never call these directly —
+    // opt in to the proxy by passing a `HttpProxyConfig` to
+    // `GatewayClient::with_http_proxy`.
+
+    /// Emit a `proxy_resp_head` envelope for stream `stream_id`.
+    pub async fn emit_proxy_resp_head(
+        &self,
+        stream_id: u64,
+        status: u16,
+        headers: &[(String, String)],
+    ) -> Result<(), SdkError> {
+        let header_arr: Vec<Value> = headers
+            .iter()
+            .map(|(k, v)| json!([k, v]))
+            .collect();
+        self.send_envelope(
+            "proxy_resp_head",
+            json!({
+                "stream_id": stream_id,
+                "status": status,
+                "headers": header_arr,
+            }),
+        )
+        .await
+    }
+
+    /// Emit a `proxy_data` envelope for the response side of stream
+    /// `stream_id`. `eof = true` marks the final chunk.
+    pub async fn emit_proxy_data_resp(
+        &self,
+        stream_id: u64,
+        chunk: &[u8],
+        eof: bool,
+    ) -> Result<(), SdkError> {
+        let chunk_b64 = base64_encode(chunk);
+        self.send_envelope(
+            "proxy_data",
+            json!({
+                "stream_id": stream_id,
+                "dir": "resp",
+                "chunk_b64": chunk_b64,
+                "eof": eof,
+            }),
+        )
+        .await
+    }
+
+    /// Emit a `proxy_close` envelope for stream `stream_id`. `reason` is a
+    /// fixed enum string (`stream_limit`, `method_not_allowed`, `invalid_url`,
+    /// `decode_error`, `upstream_error`, `cancelled`, `timeout`).
+    pub async fn emit_proxy_close(
+        &self,
+        stream_id: u64,
+        reason: &str,
+        error: Option<&str>,
+    ) -> Result<(), SdkError> {
+        let mut payload = serde_json::Map::new();
+        payload.insert("stream_id".into(), Value::from(stream_id));
+        payload.insert("reason".into(), Value::String(reason.to_string()));
+        if let Some(e) = error {
+            payload.insert("error".into(), Value::String(e.to_string()));
+        }
+        self.send_envelope("proxy_close", Value::Object(payload)).await
     }
 }
 
