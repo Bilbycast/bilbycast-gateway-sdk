@@ -72,6 +72,7 @@ pub mod errors;
 pub mod events;
 pub mod tls;
 pub mod ws_client;
+pub mod wizards;
 
 // ── Public re-exports (flat facade) ──
 
@@ -90,3 +91,7 @@ pub use envelope::{envelope, IncomingMessage, GATEWAY_WS_PROTOCOL_VERSION};
 pub use errors::{CommandError, SdkError};
 pub use events::{categories, EventSeverity, GatewayEvent};
 pub use ws_client::GatewayClient;
+pub use wizards::{
+    NoWizards, PlanStep, WizardDescriptor, WizardError, WizardField, WizardFieldKind,
+    WizardHandler, WizardSelectOption,
+};

@@ -256,6 +256,95 @@ unrecoverable config errors (malformed `config.toml`, missing
 required fields), or a panic / process-level fault. **"My target
 device isn't responding right now"** is not on that list.
 
+## 4a. Participating in the Flows + Topology views
+
+If your target device has the concept of a "flow" — a routed
+input → output signal path — you can have it appear on the manager's
+Flows page (`/flows`) and as edges on the Topology page (`/topology`).
+Three things must all be true together:
+
+1. **The gateway emits `stats.flows[]`** in every `stats` envelope (this
+   section).
+2. **The manager-side driver claims `ManagedEntityKind::Flow`** in
+   `managed_entity_kinds()`.
+3. **The manager-side driver lists `UiSection::Flows`** in
+   `ui_capabilities().shows_sections`.
+
+`Tunnels` follows the parallel contract: `tunnels[]` on `stats` ↔
+`ManagedEntityKind::Tunnel` ↔ `UiSection::Tunnels`.
+
+Steps 2 and 3 are two lines in the manager-side `lib.rs` — see
+[`bilbycast-manager/docs/adding-a-device-type.md`](https://github.com/bilbycast/bilbycast-manager/blob/main/docs/adding-a-device-type.md)
+section A.2.6a. The manager's `DriverRegistry::register` panics at
+startup if you wire up only one half of the pair, so half-wired drivers
+fail loud rather than rendering an empty Flows tab forever.
+
+The minimum element shape the manager UI reads off each `stats.flows[]`
+entry — extra fields are ignored, so you can attach whatever else you
+want:
+
+```jsonc
+{
+  "flow_id": "uuid",                  // required — keys the row, dedups across snapshots
+  "flow_name": "Human label",         // optional — falls back to flow_id in the UI
+  "active_input_id": "uuid",          // optional — preferred over the cached config's input_id
+  "input": {                          // required for topology signal-path edges
+    "input_type": "srt",              // routed through the JS protocolColor() table
+    "mode": "caller|listener|rendezvous",
+    "remote_addr": "host:port",       // when mode = caller / rendezvous
+    "local_addr":  "host:port"        // when mode = listener
+  },
+  "outputs": [{                       // optional but expected for any flow with egress
+    "output_id": "uuid",
+    "output_name": "Human label",
+    "output_type": "udp|rtp|srt|rist|rtmp|hls|cmaf|webrtc|...",
+    "mode": "caller|listener|rendezvous",
+    "dest_addr": "host:port"          // or one of: dest_url, ingest_url, whip_url, remote_addr, local_addr
+  }]
+}
+```
+
+Worked snippet inside your polling loop:
+
+```rust
+let flows = serde_json::json!([{
+    "flow_id":   stream.uuid,
+    "flow_name": stream.label,
+    "input":     {
+        "input_type": "srt",
+        "mode": "caller",
+        "remote_addr": stream.src,
+    },
+    "outputs": [{
+        "output_id":   stream.uuid,
+        "output_type": "udp",
+        "mode":        "listener",
+        "local_addr":  stream.dst,
+    }]
+}]);
+
+emitter.emit_stats(serde_json::json!({
+    "flows":         flows,
+    "uptime_secs":   uptime,
+    "active_flows":  active,
+    "total_flows":   total,
+})).await?;
+```
+
+**`flow_id` must be stable across polls.** If you mint a fresh UUID on
+every snapshot, the UI treats every poll as a new row and the Flows
+page churns. Derive it from a vendor-stable identifier (a session id, a
+slot index, whatever the chassis itself uses), not from the current
+`Instant`.
+
+If your target device has no native flow concept (a chassis-level
+multiplexer with per-port IP I/O, a glue device, a config-only
+appliance), it's fine — and recommended — to leave `stats.flows[]`
+absent and skip steps 2–3 on the driver side. The node still appears on
+the Topology page when the driver sets `list_in_topology = true`; it
+just won't have signal-path edges drawn through it. **Appear X is in
+this state by design** (see §8).
+
 ## 5. Config and credentials
 
 A typical gateway's `config.toml`:
@@ -364,6 +453,14 @@ See its `CLAUDE.md` and `src/` for a full real-world implementation:
 
 When Phase 6 completes, all of `ws/` will be removed and the Appear X
 binary will contain only vendor-specific code.
+
+The Appear X gateway deliberately does **not** emit `stats.flows[]`
+(see §4a) — the chassis is a multiplexer / coder mesh with IP inputs
+and outputs, not a one-input-many-outputs signal pipeline that maps
+naturally onto a bilbycast "flow". `AppearXDriver` therefore claims
+neither `UiSection::Flows` nor `ManagedEntityKind::Flow`, and the node
+appears as a Topology dot with no signal-path edges. This is a product
+decision, not a missing feature.
 
 ## 9. Frequently useful SDK bits
 
