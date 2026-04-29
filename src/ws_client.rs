@@ -27,7 +27,6 @@ use crate::dispatch::{action_is_get_config, CommandHandler};
 use crate::emit::{Emitter, OutboundFrame};
 use crate::envelope::{auth_reconnect, auth_register, envelope, IncomingMessage};
 use crate::errors::{CommandError, SdkError};
-use crate::proxy::{HttpProxyConfig, ProxyDispatcher};
 use crate::tls;
 
 /// Size of the outbound channel that `Emitter` writes into.
@@ -59,10 +58,6 @@ pub struct GatewayClient {
     /// `run()` starts, then save the observed values after every `register_ack`.
     credentials: Arc<Mutex<LiveCredentials>>,
     on_register: Option<RegisterCallback>,
-    /// Optional HTTP proxy config — when set, the SDK handles `proxy_open` /
-    /// `proxy_data` / `proxy_close` envelopes from the manager directly, no
-    /// vendor code involved. See [`crate::proxy::HttpProxyConfig`].
-    proxy_cfg: Option<HttpProxyConfig>,
 }
 
 impl GatewayClient {
@@ -88,21 +83,7 @@ impl GatewayClient {
             shutdown: CancellationToken::new(),
             credentials,
             on_register: None,
-            proxy_cfg: None,
         })
-    }
-
-    /// Enable the SDK's built-in HTTP reverse-proxy. When set, the SDK
-    /// answers `proxy_open` / `proxy_data` / `proxy_close` envelopes from the
-    /// manager directly — no vendor code involved. The vendor's
-    /// `CommandHandler` is unaffected.
-    ///
-    /// The sidecar must also advertise `web-ui-proxy` in its
-    /// `HealthPayload.capabilities` so the manager UI gates the
-    /// "Open Device Web UI" button correctly.
-    pub fn with_http_proxy(mut self, cfg: HttpProxyConfig) -> Self {
-        self.proxy_cfg = Some(cfg);
-        self
     }
 
     /// Get an emitter for sending stats / events / health / thumbnails. Can be
@@ -271,10 +252,6 @@ impl GatewayClient {
         heartbeat.tick().await; // skip the immediate tick
 
         let emitter = Emitter::new(self.outbound_tx.clone());
-        let proxy_dispatcher = self
-            .proxy_cfg
-            .clone()
-            .map(|cfg| ProxyDispatcher::new(cfg, emitter.clone()));
 
         loop {
             tokio::select! {
@@ -294,7 +271,6 @@ impl GatewayClient {
                                 &text,
                                 self.handler.clone(),
                                 &emitter,
-                                proxy_dispatcher.as_ref(),
                             ).await {
                                 debug!("Gateway SDK: inbound handler error: {e}");
                             }
@@ -360,7 +336,6 @@ async fn handle_inbound(
     text: &str,
     handler: Arc<dyn CommandHandler>,
     emitter: &Emitter,
-    proxy: Option<&Arc<ProxyDispatcher>>,
 ) -> Result<(), SdkError> {
     let Some(incoming) = IncomingMessage::parse(text) else {
         debug!("Gateway SDK: malformed JSON envelope, dropping");
@@ -368,30 +343,6 @@ async fn handle_inbound(
     };
 
     match incoming.msg_type.as_str() {
-        // ── HTTP-proxy frames (web-ui-proxy capability) ──
-        // Routed to the SDK-builtin dispatcher when configured. If the
-        // gateway didn't opt in via `with_http_proxy`, drop silently — the
-        // manager will time out and surface 502 to the browser.
-        "proxy_open" => {
-            if let Some(d) = proxy {
-                d.handle_proxy_open(incoming.payload).await;
-            } else {
-                debug!("Gateway SDK: proxy_open received without web-ui-proxy enabled");
-            }
-            Ok(())
-        }
-        "proxy_data" => {
-            if let Some(d) = proxy {
-                d.handle_proxy_data_req(incoming.payload).await;
-            }
-            Ok(())
-        }
-        "proxy_close" => {
-            if let Some(d) = proxy {
-                d.handle_proxy_close(incoming.payload).await;
-            }
-            Ok(())
-        }
         "command" => {
             let command_id = incoming
                 .payload

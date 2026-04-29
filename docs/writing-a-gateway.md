@@ -471,7 +471,6 @@ decision, not a missing feature.
 | `GatewayClient::emitter()` | Get an emitter for stats / events / health. |
 | `GatewayClient::shutdown_token()` | Cancel to trigger graceful shutdown. |
 | `GatewayClient::on_register(cb)` | Callback fired on first-time registration. |
-| `GatewayClient::with_http_proxy(HttpProxyConfig)` | Opt in to the SDK's built-in HTTP reverse-proxy. The SDK then handles `proxy_open` / `proxy_data` / `proxy_close` envelopes from the manager directly — no vendor code. The manager surfaces the device's web UI under a per-node subdomain on its proxy origin. Hard-pin `target_base_url` + reuse your existing `reqwest::Client` (TLS pinning honoured). Also advertise the capability string `bilbycast_gateway_sdk::PROXY_CAPABILITY` (`"web-ui-proxy"`) in your `HealthPayload.capabilities` so the manager UI gates the launch button correctly. |
 | `Emitter::emit_stats` / `emit_event` / `emit_health` | The hot-path outputs. |
 | `Emitter::emit_health_with_target` | Health heartbeat plus typed `gateway_target` sub-status (target reachability, gateway host / egress IP). Drives the manager's third "Target down" amber dashboard state and the per-driver Gateway Module header. |
 | `GatewayTargetHealth { reachable, target_address, gateway_host, gateway_egress_ip, last_successful_poll_unix, last_error_code, consecutive_failures }` | Sub-status for the above. `last_error_code` is a fixed enum (`http_timeout` \| `tcp_refused` \| `tls_handshake` \| `auth_rejected` \| `rpc_protocol_error` \| `other`) — never the verbose vendor error string. |

@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-gateway-sdk"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "SDK for building 3rd-party device gateway sidecars that integrate with bilbycast-manager"
@@ -33,5 +33,3 @@ base64 = "0.22.1"
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
-wiremock = "0.6.5"
-base64 = "0.22.1"

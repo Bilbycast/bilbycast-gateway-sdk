@@ -70,7 +70,6 @@ pub mod emit;
 pub mod envelope;
 pub mod errors;
 pub mod events;
-pub mod proxy;
 pub mod tls;
 pub mod ws_client;
 pub mod wizards;
@@ -91,9 +90,6 @@ pub use emit::{Emitter, GatewayTargetHealth, OutboundFrame};
 pub use envelope::{envelope, IncomingMessage, GATEWAY_WS_PROTOCOL_VERSION};
 pub use errors::{CommandError, SdkError};
 pub use events::{categories, EventSeverity, GatewayEvent};
-pub use proxy::{HttpProxyConfig, PROXY_CAPABILITY};
-#[doc(hidden)]
-pub use proxy::ProxyDispatcher;
 pub use ws_client::GatewayClient;
 pub use wizards::{
     NoWizards, PlanStep, WizardDescriptor, WizardError, WizardField, WizardFieldKind,

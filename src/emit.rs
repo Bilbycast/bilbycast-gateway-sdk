@@ -129,8 +129,8 @@ impl Emitter {
     /// per-flow thumbnail protocol; the manager stores it in
     /// `NodeHub.thumbnail_cache` keyed on `"node_id:flow_id"`.
     pub async fn emit_thumbnail(&self, flow_id: &str, jpeg: Bytes) -> Result<(), SdkError> {
-        // Base64-encode the JPEG — the manager-side protocol expects a JSON payload.
-        let encoded = base64_encode(&jpeg);
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
         self.send_envelope(
             "thumbnail",
             json!({
@@ -181,122 +181,5 @@ impl Emitter {
     /// task already handles this transparently; exposed for completeness.
     pub async fn emit_pong(&self) -> Result<(), SdkError> {
         self.send_envelope("pong", Value::Null).await
-    }
-
-    // ── HTTP-proxy frames (web-ui-proxy capability) ──
-    //
-    // These three emit methods are used by the SDK's built-in proxy
-    // dispatcher (`proxy.rs`). Vendor sidecars never call these directly —
-    // opt in to the proxy by passing a `HttpProxyConfig` to
-    // `GatewayClient::with_http_proxy`.
-
-    /// Emit a `proxy_resp_head` envelope for stream `stream_id`.
-    pub async fn emit_proxy_resp_head(
-        &self,
-        stream_id: u64,
-        status: u16,
-        headers: &[(String, String)],
-    ) -> Result<(), SdkError> {
-        let header_arr: Vec<Value> = headers
-            .iter()
-            .map(|(k, v)| json!([k, v]))
-            .collect();
-        self.send_envelope(
-            "proxy_resp_head",
-            json!({
-                "stream_id": stream_id,
-                "status": status,
-                "headers": header_arr,
-            }),
-        )
-        .await
-    }
-
-    /// Emit a `proxy_data` envelope for the response side of stream
-    /// `stream_id`. `eof = true` marks the final chunk.
-    pub async fn emit_proxy_data_resp(
-        &self,
-        stream_id: u64,
-        chunk: &[u8],
-        eof: bool,
-    ) -> Result<(), SdkError> {
-        let chunk_b64 = base64_encode(chunk);
-        self.send_envelope(
-            "proxy_data",
-            json!({
-                "stream_id": stream_id,
-                "dir": "resp",
-                "chunk_b64": chunk_b64,
-                "eof": eof,
-            }),
-        )
-        .await
-    }
-
-    /// Emit a `proxy_close` envelope for stream `stream_id`. `reason` is a
-    /// fixed enum string (`stream_limit`, `method_not_allowed`, `invalid_url`,
-    /// `decode_error`, `upstream_error`, `cancelled`, `timeout`).
-    pub async fn emit_proxy_close(
-        &self,
-        stream_id: u64,
-        reason: &str,
-        error: Option<&str>,
-    ) -> Result<(), SdkError> {
-        let mut payload = serde_json::Map::new();
-        payload.insert("stream_id".into(), Value::from(stream_id));
-        payload.insert("reason".into(), Value::String(reason.to_string()));
-        if let Some(e) = error {
-            payload.insert("error".into(), Value::String(e.to_string()));
-        }
-        self.send_envelope("proxy_close", Value::Object(payload)).await
-    }
-}
-
-// ── Minimal standalone base64 encoder (no extra crate) ──
-
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
-        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    let rem = data.len() - i;
-    if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::base64_encode;
-
-    #[test]
-    fn base64_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 }
