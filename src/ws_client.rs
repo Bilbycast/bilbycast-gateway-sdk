@@ -17,6 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -34,6 +35,19 @@ const OUTBOUND_CHANNEL_SIZE: usize = 256;
 
 /// Hard timeout for the auth handshake.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum size of an incoming WebSocket message / frame from the manager.
+///
+/// Mirrors the manager-side cap (`MAX_WS_MSG_SIZE` in `manager-core`). The
+/// manager will already reject anything larger before it hits the wire, so
+/// in normal operation this limit is never approached. It exists as
+/// defense-in-depth: if the manager's cap is ever bypassed or
+/// misconfigured, bounding the SDK side prevents a hostile or buggy peer
+/// from forcing a multi-gigabyte allocation in the sidecar.
+///
+/// `tokio-tungstenite`'s default is 64 MiB / 16 MiB (message / frame),
+/// which is well above anything legitimate WS traffic produces here.
+const MAX_INBOUND_WS_BYTES: usize = 5 * 1024 * 1024;
 
 /// State shared between the read task and the connect loop across reconnects.
 #[derive(Debug, Clone, Default)]
@@ -174,10 +188,16 @@ impl GatewayClient {
         )?;
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
 
+        // Bound inbound WS message + frame size to match the manager-side cap.
+        // See `MAX_INBOUND_WS_BYTES` for rationale.
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_INBOUND_WS_BYTES))
+            .max_frame_size(Some(MAX_INBOUND_WS_BYTES));
+
         let (ws_stream, _resp) = tokio::select! {
             res = tokio_tungstenite::connect_async_tls_with_config(
                 url,
-                None,
+                Some(ws_config),
                 false,
                 Some(connector),
             ) => res?,
