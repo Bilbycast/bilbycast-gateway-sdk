@@ -4,6 +4,26 @@ All notable changes to `bilbycast-gateway-sdk` are recorded here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Shared canonical-manifest builder** at `scripts/build-manifest.sh`.
+  Generalises the edge's per-binary script with `<binary_prefix>` +
+  `<device_type>` arguments, so every vendor sidecar uses the same
+  canonicalisation logic for the Sigstore-signed `manifest.json`.
+- `writing-a-gateway.md` §9a (Remote upgrade) rewritten as a complete
+  step-by-step wiring guide pointing at `bilbycast-appear-x-api-gateway`
+  as the canonical reference implementation.
+- `writing-a-gateway.md` §9b (Packaging — install bundle + systemd unit)
+  with the canonical `/opt/bilbycast/<name>-gateway/` layout and
+  service-account conventions.
+
+### Note
+
+The SDK's `upgrade::*` machinery (mirroring the edge's) was already
+shipped in 0.6.0 — this release adds the shared release pipeline +
+docs + sidecar reference wiring needed to make it usable end-to-end.
+
 ## [0.1.0] - 2026-04-23
 
 ### Added

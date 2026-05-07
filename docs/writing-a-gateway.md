@@ -480,6 +480,217 @@ decision, not a missing feature.
 | `CommandError::validation("slot required")` | Standard `error_code = validation_error`. |
 | `GATEWAY_WS_PROTOCOL_VERSION` | `1` — matches manager's `WS_PROTOCOL_VERSION`. |
 
+## 9a. Remote upgrade (Sigstore-keyless, parameterised)
+
+Every gateway sidecar can opt into manager-driven binary upgrades. The
+SDK ships the same Sigstore-verified machinery the edge uses, just
+parameterised by your repo + binary name + identity allowlist. See
+[`bilbycast-edge/docs/upgrade.md`](../../bilbycast-edge/docs/upgrade.md)
+for the operator runbook and
+[`bilbycast-edge/docs/security.md`](../../bilbycast-edge/docs/security.md)
+for the trust model.
+
+> **Reference implementation**:
+> [`bilbycast-appear-x-api-gateway`](../../bilbycast-appear-x-api-gateway/)
+> wires every step below. Concrete files to copy from:
+> - `src/upgrade_profile.rs` — `ALLOWED_SIGNERS` + `UpgradeProfile` const
+> - `src/main.rs` — boot watchdog, coordinator, event-forwarder task,
+>   periodic watchdog, healthy-beat recorder, capability advertisement
+> - `src/appear_x/commands.rs::dispatch_upgrade_binary` — the WS arm
+> - `packaging/install-appear-x-gateway.sh` + the matching systemd unit
+> - `.github/workflows/nightly-release.yml` — Sigstore signing, manifest
+>   builder, paranoid self-verify, release publish
+
+### Wire-up
+
+1. **Pin your repo + workflow path** in a `&'static [AllowedSigner]`
+   constant. Never reuse another binary's allowlist:
+   ```rust
+   use bilbycast_gateway_sdk::upgrade::{AllowedSigner, UpgradeProfile};
+
+   pub const MY_SIGNERS: &[AllowedSigner] = &[
+       AllowedSigner {
+           issuer: "https://token.actions.githubusercontent.com",
+           repo: "https://github.com/Bilbycast/<your-repo>",
+           ref_pattern: "refs/tags/v*",
+           workflow: "https://github.com/Bilbycast/<your-repo>/.github/workflows/nightly-release.yml",
+       },
+   ];
+
+   pub const PROFILE: UpgradeProfile = UpgradeProfile {
+       repo: "Bilbycast/<your-repo>",
+       binary_name: "<your-binary>",
+       device_type: "<your-device-type>",  // matches manifest.json
+       allowed_signers: MY_SIGNERS,
+   };
+   ```
+
+2. **Open an event channel** and **run the boot watchdog before any
+   other init**, so a crash-loop on a freshly-staged binary triggers
+   the symlink revert + `exit(1)` on the (`max_boot_attempts` + 1)th
+   boot:
+   ```rust
+   use bilbycast_gateway_sdk::upgrade::{
+       run_boot_watchdog, UpgradeCoordinator, UpgradeEvent, WatchdogOutcome,
+   };
+
+   let (upgrade_event_tx, upgrade_event_rx) =
+       tokio::sync::mpsc::channel::<UpgradeEvent>(64);
+
+   match run_boot_watchdog(cfg.upgrade.as_ref(), &upgrade_event_tx) {
+       Ok(WatchdogOutcome::RolledBack { from_version, to_version }) => {
+           tracing::warn!("rolled back {from_version} → {to_version}");
+       }
+       Ok(_) => {}
+       Err(e) => tracing::warn!("boot watchdog error: {e:#}"),
+   }
+   ```
+
+3. **Construct the `UpgradeCoordinator`** before connecting the WS so
+   it's available to your command handler from the first frame:
+   ```rust
+   let upgrade_coord = cfg.upgrade.as_ref().map(|cfg| {
+       std::sync::Arc::new(UpgradeCoordinator::new(
+           PROFILE,
+           cfg.clone(),
+           upgrade_event_tx.clone(),
+           env!("CARGO_PKG_VERSION").to_string(),
+       ))
+   });
+   ```
+
+4. **Spawn an event-forwarder task** that drains the channel into your
+   `Emitter`, so upgrade lifecycle events ride the same WS path as
+   every other vendor event:
+   ```rust
+   tokio::spawn(async move {
+       while let Some(ev) = upgrade_event_rx.recv().await {
+           let severity = match ev.severity {
+               "critical" => EventSeverity::Critical,
+               "major" => EventSeverity::Major,
+               _ => EventSeverity::Info,
+           };
+           let event = GatewayEvent::new(severity, "upgrade", ev.message)
+               .with_error_code(ev.error_code);
+           let _ = emitter.emit_event(event).await;
+       }
+   });
+   ```
+
+5. **Add an `upgrade_binary` arm** to your `CommandHandler::handle_command`
+   that calls `coord.stage(version, channel, target_arch, variant)`
+   then schedules `std::process::exit(0)` after a short drain so
+   systemd respawns into the new binary via the `current/` symlink.
+   See `bilbycast-appear-x-api-gateway::commands::dispatch_upgrade_binary`
+   for a copy-paste implementation. **Important**: route the arm even
+   when your real handler hasn't initialised yet (e.g. while you're
+   still discovering the vendor device's capabilities). Sidecar
+   self-upgrade must work when the target is unreachable, otherwise
+   you can't ship a fix to a sidecar whose target is offline.
+
+6. **Spawn the periodic watchdog** so the binary transitions
+   `pending_health → stable` after the configured
+   `boot_health_window_secs`:
+   ```rust
+   if let Some(ref up_cfg) = cfg.upgrade {
+       if up_cfg.enabled {
+           tokio::spawn(upgrade::watchdog::run_watchdog_periodic(
+               up_cfg.install_root.clone(),
+               up_cfg.clone(),
+               upgrade_event_tx.clone(),
+               shutdown.clone(),
+           ));
+       }
+   }
+   ```
+
+7. **Stamp `last_health_at`** from a small ticker (or, better, from
+   your manager-auth callback like
+   [`bilbycast-edge/src/manager/client.rs`](../../bilbycast-edge/src/manager/client.rs)).
+   The periodic watchdog uses this timestamp + a 60 s freshness
+   window to decide whether to promote.
+
+8. **Advertise the `"upgrade"` capability** on every health envelope
+   so the manager UI lights up the per-node Upgrade button. Advertise
+   it unconditionally — the SDK upgrade module is always compiled in,
+   mirroring the edge's baseline. When the operator hasn't wired
+   `[upgrade]` in the gateway TOML, `dispatch_upgrade_binary` safely
+   refuses with `upgrade_disabled` and a pointer at the missing
+   config; the button stays visible so operators can discover the
+   feature instead of having to first edit the TOML to make it appear.
+
+### Release pipeline (GitHub Actions)
+
+The shared canonical-manifest builder lives at
+[`bilbycast-gateway-sdk/scripts/build-manifest.sh`](../scripts/build-manifest.sh).
+It takes `<binary_prefix>` + `<device_type>` arguments so every vendor
+sidecar uses the same canonicalisation logic. Your release workflow
+should:
+
+1. Build per-arch tarballs containing binary + LICENSE + README +
+   `packaging/` + `config/`. Naming convention:
+   `<binary_prefix>-<arch>-linux.tar.gz`. Versionless asset names so
+   `/releases/latest/download/<asset>` always resolves.
+
+2. Check out the SDK with `path: bilbycast-gateway-sdk` and call
+   `bilbycast-gateway-sdk/scripts/build-manifest.sh` to produce
+   `manifest.json`.
+
+3. Sign the manifest with `cosign sign-blob --bundle` (Sigstore
+   keyless — no long-lived signing key). Add `id-token: write` to the
+   workflow's `permissions:` block.
+
+4. **Self-verify** the signature with `cosign verify-blob` against
+   your `ALLOWED_SIGNERS` regex BEFORE publishing the release. This
+   catches any mismatch between the workflow path and the allowlist
+   here, not in production rollback territory.
+
+5. Add `manifest.json`, `manifest.sig.bundle`, and the standalone
+   install / uninstall / service unit files to the release alongside
+   the per-arch tarballs.
+
+The SDK uses the same Sigstore Fulcio + Rekor pipeline as the edge —
+sidecars piggyback on the existing trust roots, so vendors don't
+manage signing keys.
+
+## 9b. Packaging — install bundle + systemd unit
+
+Pair a curl-pipe-bash installer with a hardened systemd unit so
+operators can stand up your sidecar in one shot. The Appear X gateway
+ships the canonical pattern under
+[`bilbycast-appear-x-api-gateway/packaging/`](../../bilbycast-appear-x-api-gateway/packaging/);
+copy + adapt:
+
+| File | Purpose |
+|------|---------|
+| `install-<name>-gateway.sh` | curl-pipe-bash installer — downloads + verifies signed manifest, lays out `/opt/bilbycast/<name>-gateway/`, writes initial config.toml, installs systemd unit, polls for service health |
+| `uninstall-<name>-gateway.sh` | removes service, install root, data root; preserves config unless `--purge-config`; preserves `bilbycast-gateway` user when other gateways are still installed |
+| `bilbycast-<name>-gateway.service` | hardened systemd unit (`ProtectSystem=strict`, no `CapabilityBoundingSet`, no `AmbientCapabilities`, no `/dev/dri`/`/dev/snd` device allow-list) |
+| `bilbycast-<name>-gateway.sysusers` | `systemd-sysusers` config for the service account |
+
+Conventions:
+
+- **Install root**: `/opt/bilbycast/<name>-gateway/` so multiple gateways
+  on one host don't collide. Mirrors the edge's `/opt/bilbycast/edge/`
+  layout — `versions/<v>/`, `current` symlink, `state.json`,
+  `config.toml`, `credentials.json`.
+- **Data root**: `/var/lib/bilbycast/<name>-gateway/` for any state
+  that doesn't fit in the install root.
+- **Service account**: `bilbycast-gateway` (shared across vendor
+  sidecars on a host, since they all do the same kind of thing — talk
+  to the manager + a vendor device).
+- **Systemd unit**: `ExecStart` resolves through `current/` so a
+  successful staged upgrade lands the moment the old binary exits.
+  Use `Restart=always` paired with `StartLimitBurst` so a crash-loop
+  caps out and the boot watchdog can drive the rollback.
+- **Env file**: `/etc/bilbycast/<name>-gateway.env` for `RUST_LOG` etc.
+  so operators can tune log verbosity without editing the unit.
+
+> **Tip**: keep your installer's `--manager wss://...
+> --registration-token <tok> --<vendor-flags>` argument shape parallel
+> to the Appear X installer. Operators standing up a fleet of mixed
+> sidecars get familiar muscle memory.
+
 ## 10. What this SDK deliberately does NOT do
 
 - **Client-side event rate limiting** (the manager's 1000/min per-node

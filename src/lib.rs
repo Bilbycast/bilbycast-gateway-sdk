@@ -73,6 +73,12 @@ pub mod events;
 pub mod tls;
 pub mod ws_client;
 pub mod wizards;
+/// Remote binary upgrade machinery for gateway sidecars. Mirrors
+/// the edge upgrade pipeline (Sigstore-verified manifest fetch,
+/// streaming SHA-256, atomic symlink swap, boot watchdog) but
+/// parameterised by [`upgrade::UpgradeProfile`] so every vendor
+/// gateway inherits the same plumbing without duplicating code.
+pub mod upgrade;
 
 // ── Public re-exports (flat facade) ──
 
@@ -94,4 +100,10 @@ pub use ws_client::GatewayClient;
 pub use wizards::{
     NoWizards, PlanStep, WizardDescriptor, WizardError, WizardField, WizardFieldKind,
     WizardHandler, WizardSelectOption,
+};
+
+// ── Remote upgrade re-exports ──
+pub use upgrade::{
+    error_codes as upgrade_error_codes, AllowedSigner, StagedUpgrade, UpgradeConfig,
+    UpgradeCoordinator, UpgradeError, UpgradeEvent, UpgradeProfile,
 };
