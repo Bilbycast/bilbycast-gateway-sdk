@@ -121,21 +121,23 @@ BILBYCAST_ALLOW_INSECURE=1 ./my-gateway --config config.toml
 Pure Rust, no OpenSSL. Pinned to match the Appear X reference gateway's
 versions:
 
+Versions track `Cargo.toml`; see it for exact patch pins.
+
 | crate | version |
 |---|---|
-| tokio | 1.52.1 |
-| tokio-tungstenite | 0.29.0 (rustls-tls-webpki-roots) |
-| rustls | 0.23.39 |
-| webpki-roots | 1.0.7 |
+| tokio | 1.52 |
+| tokio-tungstenite | 0.29 (rustls-tls-webpki-roots) |
+| rustls | 0.23 |
+| webpki-roots | 1.0 |
 | serde / serde_json | 1.0 |
-| chrono | 0.4.44 |
-| async-trait | 0.1.89 |
-| tokio-util | 0.7.18 |
-| futures-util | 0.3.32 |
+| chrono | 0.4 |
+| async-trait | 0.1 |
+| tokio-util | 0.7 |
+| futures-util | 0.3 |
 | thiserror | 2.0 |
-| url | 2.5.4 |
-| bytes | 1.9 |
-| sha2 | 0.10.8 |
+| url | 2.5 |
+| bytes | 1.11 |
+| sha2 | 0.11 |
 
 ## Licensing
 

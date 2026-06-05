@@ -442,17 +442,16 @@ WantedBy=multi-user.target
 See its `CLAUDE.md` and `src/` for a full real-world implementation:
 
 - `config.rs` — TOML shape (`[manager]` / `[vendor]` / `[polling]`).
-- `credentials.rs` — 0600-mode JSON credential persistence (pre-SDK; the
-  SDK's `CredentialStore` helper is a drop-in replacement).
-- `ws/client.rs` — WS client (pre-SDK; Phase 6 of the refactor swaps it
-  for `bilbycast_gateway_sdk::GatewayClient`).
 - `appear_x/polling.rs` — polling engine, emits `stats` / `health` /
   `event` envelopes.
 - `appear_x/commands.rs` — command handler, translates manager commands
   to Appear X JSON-RPC calls.
 
-When Phase 6 completes, all of `ws/` will be removed and the Appear X
-binary will contain only vendor-specific code.
+The migration onto the SDK is complete: the Appear X gateway no longer
+carries its own WS client or credential store. `src/main.rs` builds a
+`bilbycast_gateway_sdk::GatewayClient` via `GatewayClient::connect`, and
+credential persistence uses the SDK's `CredentialStore` helper. There is
+no `src/ws/` tree — the binary now contains only vendor-specific code.
 
 The Appear X gateway deliberately does **not** emit `stats.flows[]`
 (see §4a) — the chassis is a multiplexer / coder mesh with IP inputs
@@ -695,9 +694,9 @@ Conventions:
 
 - **Client-side event rate limiting** (the manager's 1000/min per-node
   limiter). The Appear X gateway implements a 950/min self-gate in
-  `ws/event_gate.rs`; once Phase 6 extracts it from the Appear X tree,
-  a future SDK release will expose it as an opt-in helper. For now,
-  implement it in your gateway if you expect alarm-storm scenarios.
+  `src/event_gate.rs`; a future SDK release may lift it into the SDK as
+  an opt-in helper. For now, implement it in your gateway if you expect
+  alarm-storm scenarios.
 - **Config-template enforcement**, managed-flow push-status tracking,
   tunnel reconciliation, etc. Those are manager-side concepts driven by
   the `DeviceDriver` implementation in `manager-core/src/drivers/`, not

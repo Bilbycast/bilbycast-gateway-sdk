@@ -18,11 +18,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the canonical `/opt/bilbycast/<name>-gateway/` layout and
   service-account conventions.
 
-### Note
+## [0.7.1]
 
-The SDK's `upgrade::*` machinery (mirroring the edge's) was already
-shipped in 0.6.0 — this release adds the shared release pipeline +
-docs + sidecar reference wiring needed to make it usable end-to-end.
+### Added
+- Shared release-pipeline + docs + sidecar reference wiring that make the
+  `upgrade::*` machinery usable end-to-end (the shared canonical-manifest
+  builder and the `writing-a-gateway.md` §9a/§9b guides previously tracked
+  under Unreleased land here).
+
+## [0.6.0]
+
+### Added
+- **`upgrade::*` machinery** — the manager-driven, Sigstore-keyless remote
+  binary upgrade stack mirroring bilbycast-edge: manifest fetch + bundle
+  verification against a per-binary `ALLOWED_SIGNERS` allowlist, SHA-256
+  pinning, boot watchdog. Parameterised by `UpgradeProfile { repo,
+  binary_name, device_type, allowed_signers }` so each vendor sidecar
+  accepts only its own release workflow's signatures.
+
+## [0.2.0] – [0.5.0]
+
+Intermediate releases between the initial 0.1.0 and the upgrade machinery
+in 0.6.0. These versions were not captured here at the time; consult the
+git history for per-release detail.
 
 ## [0.1.0] - 2026-04-23
 
