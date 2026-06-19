@@ -14,8 +14,9 @@
 //! backoff from `ReconnectBackoff`. Backoff resets on a successful auth.
 
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
@@ -60,6 +61,76 @@ struct LiveCredentials {
 /// Callback fired on first-time registration with `(node_id, node_secret)`.
 pub type RegisterCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// Lock-free, cloneable view of the manager-link connection state.
+///
+/// This is the SDK's device-side link indicator: a sidecar built on the SDK
+/// can clone a [`ConnectionState`] handle (via [`GatewayClient::connection_state`])
+/// before `run()` and read it from any task — an HTTP `/health` endpoint, a
+/// local UI, a status LED driver — to surface "manager link up/down" locally,
+/// without touching the manager↔node WebSocket protocol.
+///
+/// Updates are written by the SDK's connect/reconnect loop:
+/// `connected` flips to `true` on a successful auth handshake and back to
+/// `false` the moment the session ends or a connect attempt fails.
+#[derive(Debug, Clone)]
+pub struct ConnectionState {
+    connected: Arc<AtomicBool>,
+    /// Unix epoch seconds of the most recent successful auth, or `0` if the
+    /// link has never come up since process start.
+    last_connect_epoch: Arc<AtomicU64>,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            connected: Arc::new(AtomicBool::new(false)),
+            last_connect_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// `true` while the manager WebSocket link is up (authenticated and not yet
+    /// closed). Lock-free; safe to poll on a hot path.
+    pub fn is_connected(&self) -> bool {
+        // Acquire pairs with the Release stores in `set_connected` /
+        // `set_disconnected`: a reader that observes `connected == true` is
+        // guaranteed to also see the epoch written before the flag.
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Unix epoch seconds of the most recent successful auth handshake, or
+    /// `None` if the link has never come up since process start.
+    pub fn last_connect_epoch(&self) -> Option<u64> {
+        match self.last_connect_epoch.load(Ordering::Acquire) {
+            0 => None,
+            secs => Some(secs),
+        }
+    }
+
+    /// Mark the link up and record the connect time. Called on successful auth.
+    fn set_connected(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Store the epoch BEFORE the connected flag, both with Release ordering,
+        // so a reader observing `connected == true` via an Acquire load is
+        // guaranteed to also see this epoch (no torn cross-atomic view).
+        self.last_connect_epoch.store(now, Ordering::Release);
+        self.connected.store(true, Ordering::Release);
+    }
+
+    /// Mark the link down. Called on session end / connect failure.
+    fn set_disconnected(&self) {
+        self.connected.store(false, Ordering::Release);
+    }
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The running gateway client.
 pub struct GatewayClient {
     cfg: GatewayConfig,
@@ -72,6 +143,8 @@ pub struct GatewayClient {
     /// `run()` starts, then save the observed values after every `register_ack`.
     credentials: Arc<Mutex<LiveCredentials>>,
     on_register: Option<RegisterCallback>,
+    /// Lock-free manager-link state, cloneable to any task for local surfacing.
+    connection_state: ConnectionState,
 }
 
 impl GatewayClient {
@@ -97,7 +170,24 @@ impl GatewayClient {
             shutdown: CancellationToken::new(),
             credentials,
             on_register: None,
+            connection_state: ConnectionState::new(),
         })
+    }
+
+    /// Cloneable, lock-free handle to the manager-link connection state.
+    ///
+    /// Call this before `run()` and hand the clone to any task (HTTP health
+    /// endpoint, local UI, status indicator) that needs to surface whether the
+    /// manager link is up. The handle keeps reflecting live state across
+    /// reconnects for the lifetime of the process.
+    pub fn connection_state(&self) -> ConnectionState {
+        self.connection_state.clone()
+    }
+
+    /// Convenience: `true` while the manager WebSocket link is up. Equivalent to
+    /// `self.connection_state().is_connected()`.
+    pub fn is_connected(&self) -> bool {
+        self.connection_state.is_connected()
     }
 
     /// Get an emitter for sending stats / events / health / thumbnails. Can be
@@ -143,7 +233,14 @@ impl GatewayClient {
             let url = self.cfg.manager_urls[url_cursor % self.cfg.manager_urls.len()].clone();
             info!("Gateway SDK: connecting to {url} (attempt {attempt})");
 
-            match self.one_connection(&url).await {
+            let result = self.one_connection(&url).await;
+
+            // Whatever the outcome, the link is now down. Flip the public
+            // connection flag so any task surfacing local link state reacts
+            // immediately. (`one_connection` sets it true on successful auth.)
+            self.connection_state.set_disconnected();
+
+            match result {
                 Ok(ConnectionResult::AuthenticatedThenClosed) => {
                     // Successful session — reset backoff.
                     attempt = 0;
@@ -162,6 +259,14 @@ impl GatewayClient {
             url_cursor = url_cursor.wrapping_add(1);
             attempt = attempt.saturating_add(1);
             let delay = self.cfg.reconnect_backoff.delay_for_attempt(attempt);
+            // Primary device-side outage signal for headless sidecars (no local
+            // UI): one rate-limited WARN per reconnect attempt while the manager
+            // link is down. An operator tailing the log sees the outage and the
+            // retry cadence without it spamming once-per-second.
+            warn!(
+                "Gateway SDK: manager link unavailable, reconnecting (attempt {attempt}, next in {}s)",
+                delay.as_secs()
+            );
             info!(
                 "Gateway SDK: reconnecting in {} seconds (next URL index {}/{})",
                 delay.as_secs(),
@@ -266,6 +371,10 @@ impl GatewayClient {
                 info!("Gateway SDK: authenticated with manager");
             }
         }
+
+        // Auth succeeded — the manager link is up. Publish it on the lock-free
+        // connection flag so any task surfacing local link state sees it.
+        self.connection_state.set_connected();
 
         // 3. Main message loop.
         let mut heartbeat = tokio::time::interval(self.cfg.heartbeat_interval);
@@ -419,4 +528,42 @@ async fn handle_inbound(
 #[allow(dead_code)]
 fn _assert_command_error_exported(e: CommandError) -> CommandError {
     e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_state_starts_disconnected() {
+        let s = ConnectionState::new();
+        assert!(!s.is_connected());
+        assert_eq!(s.last_connect_epoch(), None);
+    }
+
+    #[test]
+    fn connection_state_tracks_up_then_down() {
+        let s = ConnectionState::new();
+        s.set_connected();
+        assert!(s.is_connected());
+        // Connect epoch is recorded (non-zero in any realistic test run).
+        assert!(s.last_connect_epoch().is_some());
+
+        let epoch_after_up = s.last_connect_epoch();
+        s.set_disconnected();
+        assert!(!s.is_connected());
+        // Going down preserves the last-connect timestamp.
+        assert_eq!(s.last_connect_epoch(), epoch_after_up);
+    }
+
+    #[test]
+    fn connection_state_clone_shares_underlying_atomics() {
+        let s = ConnectionState::new();
+        let cloned = s.clone();
+        s.set_connected();
+        // The clone observes the same state — it's a handle, not a snapshot.
+        assert!(cloned.is_connected());
+        s.set_disconnected();
+        assert!(!cloned.is_connected());
+    }
 }
