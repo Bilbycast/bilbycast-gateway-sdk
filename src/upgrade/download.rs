@@ -161,8 +161,13 @@ fn build_client(timeout: Duration) -> Result<reqwest::Client> {
             version = env!("CARGO_PKG_VERSION")
         ))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // GitHub's release CDN redirects to objects.githubusercontent.com;
-            // both hosts are in the whitelist, so we accept up to 5 hops.
+            // GitHub 302-redirects release-asset downloads to its content CDN
+            // (release-assets.githubusercontent.com today; objects.* on older
+            // / Enterprise flows). We follow within the *.githubusercontent.com
+            // family — see `manifest::redirect_host_allowed` for why that's
+            // safe (GitHub-controlled domain + SHA-256-verified body) and why
+            // it must be looser than the exact-match ALLOWED_URL_HOSTS. Cap at
+            // 5 hops.
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
             } else {
@@ -172,7 +177,7 @@ fn build_client(timeout: Duration) -> Result<reqwest::Client> {
                 }
                 let host_ok = url
                     .host_str()
-                    .map(|h| super::manifest::ALLOWED_URL_HOSTS.iter().any(|a| h == *a))
+                    .map(super::manifest::redirect_host_allowed)
                     .unwrap_or(false);
                 if host_ok {
                     attempt.follow()

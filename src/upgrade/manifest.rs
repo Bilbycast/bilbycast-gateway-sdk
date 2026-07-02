@@ -13,8 +13,18 @@ use serde::{Deserialize, Serialize};
 
 use super::UpgradeConfig;
 
-/// Hosts allowed to serve manifests / tarballs.
-pub const ALLOWED_URL_HOSTS: &[&str] = &["github.com", "objects.githubusercontent.com"];
+/// Hosts allowed in the URLs a sidecar *constructs* and the manifest
+/// *declares* (`artefacts[].url`). Exact-match — a sidecar only ever
+/// generates `github.com` URLs; the CDN hosts are listed for
+/// defence-in-depth. Redirect *targets* (chosen by GitHub) are governed by
+/// the looser [`redirect_host_allowed`].
+pub const ALLOWED_URL_HOSTS: &[&str] = &[
+    "github.com",
+    // GitHub's release-asset CDN. `release-assets.*` is current;
+    // `objects.*` is the legacy host still used by older / Enterprise flows.
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -103,6 +113,26 @@ pub fn validate_url_host(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Is `host` acceptable as a *redirect target* while fetching an upgrade
+/// artefact?
+///
+/// GitHub answers a `github.com/.../releases/download/...` request with a
+/// `302` to its content CDN and periodically renames that CDN host (it
+/// moved from `objects.githubusercontent.com` to
+/// `release-assets.githubusercontent.com`, which silently broke every node
+/// pinning the old name). The redirect target stays within GitHub's own
+/// `githubusercontent.com` domain and the body is SHA-256-verified against
+/// the signed manifest regardless, so we accept the whole
+/// `*.githubusercontent.com` family — looser than [`ALLOWED_URL_HOSTS`] but
+/// still confined to GitHub, and it survives the next CDN rename without a
+/// binary push. The leading `.` on the suffix check rejects lookalikes
+/// (`evilgithubusercontent.com`, `githubusercontent.com.evil.com`).
+pub fn redirect_host_allowed(host: &str) -> bool {
+    host == "github.com"
+        || host == "githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
 /// Construct the GitHub release base URL for the given repo + version.
 /// `repo` should be `<owner>/<name>` and is validated only via the
 /// resulting URL host check (no allowlist of repos in the SDK — each
@@ -146,4 +176,40 @@ pub fn check_version_window(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_host_whitelist_accepts_release_assets_cdn() {
+        // GitHub's current release-asset CDN host. Regression guard for the
+        // objects.* → release-assets.* migration that broke sidecar upgrades.
+        validate_url_host("https://release-assets.githubusercontent.com/abc/def?sig=x").unwrap();
+        validate_url_host("https://objects.githubusercontent.com/abc/def").unwrap();
+        validate_url_host("https://github.com/Vendor/repo/releases/download/v1.0.0/x.tar.gz")
+            .unwrap();
+    }
+
+    #[test]
+    fn url_host_whitelist_rejects_other_hosts() {
+        assert!(validate_url_host("https://evil.com/foo.tar.gz").is_err());
+        assert!(validate_url_host("http://github.com/foo").is_err());
+    }
+
+    #[test]
+    fn redirect_host_allowed_covers_github_cdn_family() {
+        assert!(redirect_host_allowed("github.com"));
+        assert!(redirect_host_allowed("githubusercontent.com"));
+        assert!(redirect_host_allowed("objects.githubusercontent.com"));
+        assert!(redirect_host_allowed("release-assets.githubusercontent.com"));
+        assert!(redirect_host_allowed("some-future-cdn.githubusercontent.com"));
+
+        assert!(!redirect_host_allowed("evil.com"));
+        assert!(!redirect_host_allowed("evilgithubusercontent.com"));
+        assert!(!redirect_host_allowed("githubusercontent.com.evil.com"));
+        assert!(!redirect_host_allowed("raw.githubusercontent.com.evil.com"));
+        assert!(!redirect_host_allowed(""));
+    }
 }
