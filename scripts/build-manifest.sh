@@ -85,6 +85,14 @@ for sha_file in "${ARTIFACT_DIR}"/*.tar.gz.sha256; do
             arch="${bare%-full}"
             variant="full"
             ;;
+        *-linux-distribution)
+            # bilbycast-relay's viewer-distribution build variant
+            # (`--features viewer-distribution`). Same `<arch>-linux-<variant>`
+            # shape as `-full`; kept as a distinct arm so the variant string
+            # is explicit rather than mis-parsed as part of the arch.
+            arch="${bare%-distribution}"
+            variant="distribution"
+            ;;
         *-linux)
             arch="${bare}"
             variant="default"
