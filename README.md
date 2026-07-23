@@ -37,7 +37,10 @@ their polling loop and their [`CommandHandler`](src/dispatch.rs).
   - Self-signed mode (requires `BILBYCAST_ALLOW_INSECURE=1` env var)
   - SHA-256 fingerprint pinning
 - Credential persistence helpers (`PersistedCredentials`, `CredentialStore`).
-- `GATEWAY_WS_PROTOCOL_VERSION` constant — currently `1`, matches the manager.
+- `GATEWAY_WS_PROTOCOL_VERSION` constant — deliberately pinned at `1`. The
+  manager is now at `WS_PROTOCOL_VERSION = 4`; the two intentionally do **not**
+  match. The manager only logs a warning on mismatch and keeps the connection,
+  so the SDK stays at `1` and the mismatch is tolerated.
 
 ## Minimum viable gateway
 

@@ -17,10 +17,11 @@
 use chrono::Utc;
 use serde_json::{json, Value};
 
-/// WebSocket protocol version understood by this SDK. Must match the manager's
-/// `WS_PROTOCOL_VERSION` constant. Manager logs a warning on mismatch but does
-/// not reject — unknown message types and fields are handled gracefully on both
-/// sides.
+/// WebSocket protocol version understood by this SDK. Intentionally pinned at 1
+/// even though the manager is currently at `WS_PROTOCOL_VERSION` 4 — the two do
+/// not need to match. The manager logs a warning on a version mismatch but does
+/// not reject the connection, and unknown message types and fields are handled
+/// gracefully on both sides, so the pin is safe.
 pub const GATEWAY_WS_PROTOCOL_VERSION: u32 = 1;
 
 /// Build a JSON envelope string ready for the wire.

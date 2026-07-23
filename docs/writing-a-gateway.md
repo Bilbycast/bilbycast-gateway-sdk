@@ -477,7 +477,7 @@ decision, not a missing feature.
 | `GatewayEvent::critical("port_conflict", "…").with_error_code("…")` | Event builder. |
 | `CommandError::unknown_action("my_action")` | Standard `error_code = unknown_action`. |
 | `CommandError::validation("slot required")` | Standard `error_code = validation_error`. |
-| `GATEWAY_WS_PROTOCOL_VERSION` | `1` — matches manager's `WS_PROTOCOL_VERSION`. |
+| `GATEWAY_WS_PROTOCOL_VERSION` | `1` — deliberately pinned; manager is at `WS_PROTOCOL_VERSION = 4`, so they intentionally do **not** match. Mismatch is tolerated (manager only warns). |
 
 ## 9a. Remote upgrade (Sigstore-keyless, parameterised)
 
