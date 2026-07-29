@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0]
+
+### Changed
+- **Dependency currency sweep.** `tokio-tungstenite` 0.29 → 0.30 (matches
+  bilbycast-relay, which was already there) and `base64` 0.22 → 0.23. Both
+  are drop-in at every call site in this crate.
+- `sigstore` 0.13 → 0.14, which pulls `tough` 0.22 and clears
+  RUSTSEC GHSA-4v58-8p28-2rq3 / GHSA-8m7c-8m39-rv4x.
+- **`x509-cert` deliberately held at 0.2** even though 0.3.0 is published:
+  `sigstore` 0.14 still requires `^0.2`, and bumping ours alone resolves both
+  majors into the graph — a second X.509 parser in the release-signature
+  verification path for no functional gain. Move it in lockstep with sigstore.
+
 ### Added
 - **Shared canonical-manifest builder** at `scripts/build-manifest.sh`.
   Generalises the edge's per-binary script with `<binary_prefix>` +
