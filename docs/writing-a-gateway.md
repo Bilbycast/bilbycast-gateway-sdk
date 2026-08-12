@@ -404,8 +404,23 @@ spin up a plaintext WS server locally, connect the SDK to it, and assert
 on both directions of the wire. Copy it as the starting point for your
 gateway's integration tests.
 
-For tests you'll need to set `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1` — the
-SDK refuses plain `ws://` URLs in production.
+For tests you'll need **both** halves of the plaintext opt-in — the SDK
+refuses plain `ws://` URLs otherwise:
+
+```rust
+let mut cfg = GatewayConfig::minimal(url, "my_device", "0.1.0");
+cfg.allow_plaintext_ws = true;                       // config half
+// and in the environment:
+// BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1                // env half
+```
+
+Either alone is refused, and the error says which half is missing. Two keys
+rather than one because this was environment-only, which meant a single
+variable set anywhere — a unit file, a shell profile, a container spec —
+silently downgraded a sidecar's manager link from TLS to cleartext while it
+was carrying its node secret. The self-signed-certificate escape hatch
+(`accept_self_signed_cert` + `BILBYCAST_ALLOW_INSECURE=1`) already worked
+this way; this now matches it.
 
 ## 7. Deployment — systemd example
 

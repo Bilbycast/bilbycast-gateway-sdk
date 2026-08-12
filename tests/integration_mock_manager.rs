@@ -4,7 +4,8 @@
 //! Mock-manager integration test.
 //!
 //! Spins up a plaintext WS server on a random port (opt-in via the
-//! `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1` env var the SDK honours in tests),
+//! `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1` env var plus the
+//! `allow_plaintext_ws` config field, both of which the SDK requires),
 //! connects the SDK to it, and exercises:
 //! - Register with a token → `register_ack` + node_id/node_secret
 //! - Server sends a `command` → handler dispatched → `command_ack` matches
@@ -236,9 +237,20 @@ async fn spawn_mock_manager(
     (url, observed, issued_node_id, stop_tx)
 }
 
-/// Set the env var the SDK honours to allow `ws://` URLs in tests.
+/// Set the env half of the plaintext-`ws://` opt-in. The config half
+/// (`GatewayConfig::allow_plaintext_ws`) is set per-test by
+/// [`test_config`] — the SDK requires BOTH, so that no single environment
+/// variable can downgrade a real sidecar's manager link to cleartext.
 fn enable_plaintext_ws() {
     std::env::set_var("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS", "1");
+}
+
+/// A `GatewayConfig` pointed at the mock manager, carrying the config half
+/// of the plaintext opt-in.
+fn test_config(url: impl Into<String>) -> GatewayConfig {
+    let mut cfg = GatewayConfig::minimal(url, "test_device", "0.0.1-test");
+    cfg.allow_plaintext_ws = true;
+    cfg
 }
 
 #[tokio::test]
@@ -304,7 +316,7 @@ async fn register_then_auth_reconnect_then_commands_and_close() {
         spawn_mock_manager(vec![script_1, script_2]).await;
 
     // Build + start the gateway client.
-    let mut cfg = GatewayConfig::minimal(url.clone(), "test_device", "0.0.1-test");
+    let mut cfg = test_config(url.clone());
     cfg.registration_token = Some("test-token-1234".into());
     // Very fast reconnect so the second script fires within the test timeout.
     cfg.reconnect_backoff = bilbycast_gateway_sdk::ReconnectBackoff {
@@ -458,7 +470,7 @@ async fn unknown_manager_message_type_is_ignored() {
 
     let (url, observed, _issued, _stop) = spawn_mock_manager(vec![script]).await;
 
-    let mut cfg = GatewayConfig::minimal(url, "test_device", "0.0.1-test");
+    let mut cfg = test_config(url);
     cfg.registration_token = Some("test-token".into());
 
     let handler = Arc::new(RecordingHandler {

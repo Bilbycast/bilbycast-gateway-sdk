@@ -60,6 +60,23 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub accept_self_signed_cert: bool,
 
+    /// Permit plaintext `ws://` manager URLs. **Integration tests only.**
+    ///
+    /// Like [`Self::accept_self_signed_cert`], this needs *two* keys: this
+    /// field **and** `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1` in the
+    /// environment. Either alone is refused.
+    ///
+    /// The two-key shape is the point. This used to be an environment
+    /// variable on its own, which meant a single variable — set anywhere
+    /// in a unit file, a shell profile, a container spec — silently
+    /// downgraded a vendor sidecar's manager link from TLS to cleartext,
+    /// carrying its node secret. Every other credential-bearing escape
+    /// hatch in this codebase requires the config to consent as well, so
+    /// that turning it on is a deliberate, reviewable, greppable edit to a
+    /// file someone owns.
+    #[serde(default)]
+    pub allow_plaintext_ws: bool,
+
     /// Optional SHA-256 certificate fingerprint for certificate pinning.
     /// Colon-separated lowercase hex, e.g. `"ab:cd:ef:..."`. Takes precedence
     /// over `accept_self_signed_cert`.
@@ -95,6 +112,7 @@ impl GatewayConfig {
             node_secret: None,
             registration_token: None,
             accept_self_signed_cert: false,
+            allow_plaintext_ws: false,
             cert_fingerprint: None,
             heartbeat_interval: default_heartbeat(),
             reconnect_backoff: ReconnectBackoff::default(),
@@ -122,12 +140,24 @@ impl GatewayConfig {
                     "manager_urls[{i}] must be at most 2048 characters"
                 )));
             }
-            // Tests can opt into ws:// via the `allow_plaintext_ws` option.
-            if !url.starts_with("wss://") && !allow_plaintext_ws() {
+            // Tests can opt into ws://, but only with BOTH keys: the
+            // config field and the environment variable. See
+            // `GatewayConfig::allow_plaintext_ws`.
+            if !url.starts_with("wss://") && !(self.allow_plaintext_ws && plaintext_ws_env_set()) {
+                let hint = if self.allow_plaintext_ws {
+                    "`allow_plaintext_ws` is set in the config, but \
+                     BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 is not set in the environment — \
+                     both are required."
+                } else if plaintext_ws_env_set() {
+                    "BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 is set, but `allow_plaintext_ws` is \
+                     not set in the config — both are required."
+                } else {
+                    "Integration tests may set `allow_plaintext_ws: true` in the config AND \
+                     BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 in the environment."
+                };
                 return Err(SdkError::Config(format!(
                     "manager_urls[{i}] = {url:?} must use wss:// (TLS). \
-                     Plaintext ws:// connections are not allowed. \
-                     (Integration tests may set BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1.)"
+                     Plaintext ws:// connections are not allowed. {hint}"
                 )));
             }
             let _ = url::Url::parse(url)
@@ -174,8 +204,10 @@ impl GatewayConfig {
     }
 }
 
-/// Honored only in integration tests and only when explicitly enabled.
-fn allow_plaintext_ws() -> bool {
+/// Half of the plaintext-`ws://` opt-in. The other half is the
+/// `allow_plaintext_ws` config field; both are required. See
+/// [`GatewayConfig::allow_plaintext_ws`] for why.
+fn plaintext_ws_env_set() -> bool {
     std::env::var("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS")
         .map(|v| v == "1")
         .unwrap_or(false)
@@ -273,5 +305,46 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.heartbeat_interval = Duration::from_secs(300);
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── plaintext ws:// needs BOTH keys ─────────────────────────────────
+    //
+    // These do not touch the environment. `plaintext_ws_env_set()` reads
+    // process state, and mutating it from a test races every other test in
+    // the binary, so the config half is what is pinned here: with
+    // `allow_plaintext_ws` false, a `ws://` URL must be refused no matter
+    // what the environment says — which is the half that closes the
+    // one-variable bypass.
+
+    #[test]
+    fn plaintext_ws_is_refused_without_the_config_key() {
+        let cfg = GatewayConfig::minimal("ws://manager.test/ws/node", "t", "0.0.1");
+        assert!(!cfg.allow_plaintext_ws, "the config key must default to off");
+        let err = cfg.validate().expect_err("ws:// must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("must use wss://"), "{msg}");
+    }
+
+    #[test]
+    fn wss_is_accepted_regardless_of_the_plaintext_keys() {
+        let mut cfg = GatewayConfig::minimal("wss://manager.test/ws/node", "t", "0.0.1");
+        // Unrelated to the scheme check, but `validate` runs every rule.
+        cfg.registration_token = Some("token".into());
+        cfg.validate().expect("wss:// is always fine");
+    }
+
+    #[test]
+    fn the_error_names_which_half_is_missing() {
+        // An operator who has set one of the two needs to be told which,
+        // otherwise the message reads as "this is simply not allowed".
+        let mut cfg = GatewayConfig::minimal("ws://manager.test/ws/node", "t", "0.0.1");
+        cfg.allow_plaintext_ws = true;
+        if !plaintext_ws_env_set() {
+            let msg = cfg.validate().expect_err("env half absent").to_string();
+            assert!(
+                msg.contains("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 is not set"),
+                "{msg}"
+            );
+        }
     }
 }
