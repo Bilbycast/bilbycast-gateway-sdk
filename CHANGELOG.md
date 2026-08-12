@@ -6,6 +6,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0]
+
+### Changed — SOURCE BREAKING
+
+- **`GatewayConfig` gained a required field, `allow_plaintext_ws: bool`.** The
+  struct has all-public fields, no `#[non_exhaustive]` and no `Default`, so
+  every exhaustive struct literal must add it. Both in-repo consumers
+  (`bilbycast-appear-x-api-gateway`, `bilbycast-gateway-template`) set it to
+  `false`; a production sidecar carrying a node secret should do the same.
+
+  The break is deliberate rather than accidental: the field exists so a
+  sidecar has to *consent in its own configuration* to plaintext, and a
+  `Default` would have let the consent be skipped silently — which is the
+  defect being fixed. Migration is one line:
+
+  ```rust
+  let cfg = GatewayConfig {
+      // …
+      allow_plaintext_ws: false,
+      // …
+  };
+  ```
+
+### Security
+
+- **Plaintext `ws://` to the manager now requires BOTH the config field
+  `allow_plaintext_ws = true` AND `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1`.**
+  Previously the environment variable alone was enough, so one variable set
+  anywhere — a unit file, a shell profile, a container spec — silently
+  downgraded a vendor sidecar's manager link from TLS to cleartext while it
+  was carrying its node secret, with nothing in the sidecar's own
+  configuration recording or consenting to it. This now matches the shape of
+  the sibling escape hatch (`accept_self_signed_cert` +
+  `BILBYCAST_ALLOW_INSECURE=1`). Either key alone is refused, and the error
+  names which half is missing.
+
+### Added
+
+- **CI** (`.github/workflows/ci.yml`) — check, test and `clippy -D warnings`,
+  plus a `consumers` job that builds `bilbycast-gateway-template` and
+  `bilbycast-appear-x-api-gateway` against the SDK checkout under test. The
+  crate previously had no automation of any kind, which is how the
+  source-breaking change above reached `main` with both consumers left
+  uncompilable.
+
 ## [0.8.0]
 
 ### Changed

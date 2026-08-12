@@ -187,7 +187,7 @@ impl GatewayConfig {
         // misconfigured gateway spamming health envelopes (which would
         // crowd out other nodes on the same instance).
         let hb_secs = self.heartbeat_interval.as_secs();
-        if hb_secs < 5 || hb_secs > 300 {
+        if !(5..=300).contains(&hb_secs) {
             return Err(SdkError::Config(format!(
                 "heartbeat_interval must be 5..=300 seconds (got {hb_secs}s). \
                  Shorter intervals risk overwhelming the manager's per-node \
@@ -309,28 +309,39 @@ mod tests {
 
     // ── plaintext ws:// needs BOTH keys ─────────────────────────────────
     //
-    // These do not touch the environment. `plaintext_ws_env_set()` reads
-    // process state, and mutating it from a test races every other test in
-    // the binary, so the config half is what is pinned here: with
-    // `allow_plaintext_ws` false, a `ws://` URL must be refused no matter
-    // what the environment says — which is the half that closes the
-    // one-variable bypass.
+    // `plaintext_ws_env_set()` reads process state, so every test in this
+    // family goes through `with_plaintext_env`, which holds one mutex and
+    // always restores the variable — including on panic. Serialising the
+    // family is enough: nothing else in this binary reaches that read,
+    // because every other test validates a `wss://` URL and the scheme check
+    // short-circuits before the environment is consulted.
+    //
+    // An earlier version of this block deliberately avoided the environment
+    // and pinned only the config half. That leaves the actual bypass
+    // untested — with the env var unset, an env-only implementation refuses
+    // `ws://` too, so those tests pass unchanged against the very bug the
+    // guard exists to close. `the_env_var_alone_does_not_permit_plaintext_ws`
+    // below is the one that fails against it.
 
     #[test]
     fn plaintext_ws_is_refused_without_the_config_key() {
-        let cfg = GatewayConfig::minimal("ws://manager.test/ws/node", "t", "0.0.1");
-        assert!(!cfg.allow_plaintext_ws, "the config key must default to off");
-        let err = cfg.validate().expect_err("ws:// must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("must use wss://"), "{msg}");
+        with_plaintext_env(false, || {
+            let cfg = GatewayConfig::minimal("ws://manager.test/ws/node", "t", "0.0.1");
+            assert!(!cfg.allow_plaintext_ws, "the config key must default to off");
+            let err = cfg.validate().expect_err("ws:// must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("must use wss://"), "{msg}");
+        });
     }
 
     #[test]
     fn wss_is_accepted_regardless_of_the_plaintext_keys() {
-        let mut cfg = GatewayConfig::minimal("wss://manager.test/ws/node", "t", "0.0.1");
-        // Unrelated to the scheme check, but `validate` runs every rule.
-        cfg.registration_token = Some("token".into());
-        cfg.validate().expect("wss:// is always fine");
+        with_plaintext_env(false, || {
+            let mut cfg = GatewayConfig::minimal("wss://manager.test/ws/node", "t", "0.0.1");
+            // Unrelated to the scheme check, but `validate` runs every rule.
+            cfg.registration_token = Some("token".into());
+            cfg.validate().expect("wss:// is always fine");
+        });
     }
 
     #[test]
@@ -339,12 +350,106 @@ mod tests {
         // otherwise the message reads as "this is simply not allowed".
         let mut cfg = GatewayConfig::minimal("ws://manager.test/ws/node", "t", "0.0.1");
         cfg.allow_plaintext_ws = true;
-        if !plaintext_ws_env_set() {
-            let msg = cfg.validate().expect_err("env half absent").to_string();
+        {
+            let msg = with_plaintext_env(false, || cfg.validate().expect_err("env half absent"))
+                .to_string();
             assert!(
                 msg.contains("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 is not set"),
                 "{msg}"
             );
+        }
+    }
+
+    /// Guard: these tests mutate process-wide environment state.
+    static PLAINTEXT_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_plaintext_env<T>(set: bool, f: impl FnOnce() -> T) -> T {
+        let _g = PLAINTEXT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if set {
+            unsafe { std::env::set_var("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS", "1") };
+        } else {
+            unsafe { std::env::remove_var("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS") };
+        }
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe { std::env::remove_var("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS") };
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    fn plaintext_cfg(allow_field: bool) -> GatewayConfig {
+        let mut cfg = base_cfg();
+        cfg.manager_urls = vec!["ws://127.0.0.1:9/ws/node".to_string()];
+        cfg.allow_plaintext_ws = allow_field;
+        cfg
+    }
+
+    /// **The bypass this guard exists to close.** Before it, the environment
+    /// variable alone was enough, so one variable set anywhere — a unit file,
+    /// a shell profile, a container spec — silently downgraded a vendor
+    /// sidecar's manager link to cleartext while it carried its node secret,
+    /// with nothing in the sidecar's own configuration consenting to it.
+    ///
+    /// This is the case the integration tests could not cover: they set both
+    /// keys, so they pass identically under the old env-only logic.
+    #[test]
+    fn the_env_var_alone_does_not_permit_plaintext_ws() {
+        let err = with_plaintext_env(true, || plaintext_cfg(false).validate().unwrap_err());
+        let msg = err.to_string();
+        assert!(msg.contains("must use wss://"), "{msg}");
+        assert!(
+            msg.contains("`allow_plaintext_ws` is \nnot set in the config")
+                || msg.contains("`allow_plaintext_ws` is not set in the config"),
+            "the error must name the missing half: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_config_field_alone_does_not_permit_plaintext_ws() {
+        let err = with_plaintext_env(false, || plaintext_cfg(true).validate().unwrap_err());
+        let msg = err.to_string();
+        assert!(msg.contains("must use wss://"), "{msg}");
+        assert!(
+            msg.contains("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1 is not set"),
+            "the error must name the missing half: {msg}"
+        );
+    }
+
+    #[test]
+    fn both_keys_together_permit_plaintext_ws() {
+        with_plaintext_env(true, || {
+            plaintext_cfg(true)
+                .validate()
+                .expect("both keys present must be accepted")
+        });
+    }
+
+    #[test]
+    fn neither_key_refuses_and_says_how_to_opt_in() {
+        let err = with_plaintext_env(false, || plaintext_cfg(false).validate().unwrap_err());
+        let msg = err.to_string();
+        assert!(msg.contains("must use wss://"), "{msg}");
+        assert!(msg.contains("allow_plaintext_ws"), "{msg}");
+        assert!(msg.contains("BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1"), "{msg}");
+    }
+
+    /// `wss://` must never consult either key — a guard that only ran for
+    /// `ws://` would be fine, but one that accidentally gated the TLS path
+    /// on an env var would be a production outage.
+    #[test]
+    fn wss_is_unaffected_by_either_key() {
+        for env in [true, false] {
+            for field in [true, false] {
+                with_plaintext_env(env, || {
+                    let mut cfg = base_cfg();
+                    cfg.allow_plaintext_ws = field;
+                    cfg.validate()
+                        .unwrap_or_else(|e| panic!("wss must always validate (env={env}, field={field}): {e}"));
+                });
+            }
         }
     }
 }

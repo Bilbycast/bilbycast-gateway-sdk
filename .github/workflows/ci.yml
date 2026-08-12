@@ -1,0 +1,95 @@
+name: CI
+
+# Nothing built this crate on a PR — no build, no test, no clippy, no CI of
+# any kind — and it is a library with out-of-tree consumers, so a source-
+# breaking change here is felt in repos this workflow cannot see.
+#
+# That is not hypothetical. Adding `allow_plaintext_ws` to `GatewayConfig`
+# (a struct with all-public fields, no `#[non_exhaustive]` and no `Default`)
+# broke both in-repo consumers with E0063 and shipped anyway, because the only
+# automation that would have noticed is `nightly-release.yml` in
+# bilbycast-appear-x-api-gateway — which runs on tag push, i.e. after the tag
+# is already on origin.
+#
+# The consumer job below is the load-bearing half: it builds
+# bilbycast-gateway-template against THIS checkout of the SDK, so a
+# source-breaking change fails here rather than in somebody else's release.
+# bilbycast-appear-x-api-gateway is built the same way; both path-depend on
+# `../bilbycast-gateway-sdk`, so the checkout layout has to put the SDK in a
+# sibling directory of each consumer.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check + test + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # `-D warnings` matches the gate in bilbycast-edge and
+      # bilbycast-manager. The crate was clippy-clean when this landed; keep
+      # it that way rather than letting debt accumulate behind no gate.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  consumers:
+    name: consumers build against this SDK
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer:
+          - bilbycast-gateway-template
+          - bilbycast-appear-x-api-gateway
+    steps:
+      # Both consumers path-depend on `../bilbycast-gateway-sdk`, so lay the
+      # tree out as `work/<consumer>` + `work/bilbycast-gateway-sdk`.
+      - name: Checkout ${{ matrix.consumer }}
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/${{ matrix.consumer }}
+          path: ${{ matrix.consumer }}
+
+      - name: Checkout this SDK as the sibling path dependency
+        uses: actions/checkout@v7
+        with:
+          path: bilbycast-gateway-sdk
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.consumer }}
+
+      # NOT `--locked`: the consumer's committed Cargo.lock pins the SDK by
+      # path, and a dependency change in this PR legitimately moves it. The
+      # point of this job is the source-compatibility check, not lockfile
+      # drift.
+      - name: cargo check ${{ matrix.consumer }}
+        working-directory: ${{ matrix.consumer }}
+        run: cargo check --all-targets
