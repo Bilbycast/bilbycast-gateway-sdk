@@ -144,7 +144,7 @@ pub fn gc_versions(install_root: &Path, current_version: &str, keep: usize) -> R
         })
         .collect();
     let mut sorted = entries;
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     for (path, _) in sorted.into_iter().skip(keep) {
         let _ = fs::remove_dir_all(&path);
     }
