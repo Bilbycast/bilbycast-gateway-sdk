@@ -12,11 +12,14 @@ name: CI
 # is already on origin.
 #
 # The consumer job below is the load-bearing half: it builds
-# bilbycast-gateway-template against THIS checkout of the SDK, so a
+# bilbycast-appear-x-api-gateway against THIS checkout of the SDK, so a
 # source-breaking change fails here rather than in somebody else's release.
-# bilbycast-appear-x-api-gateway is built the same way; both path-depend on
-# `../bilbycast-gateway-sdk`, so the checkout layout has to put the SDK in a
-# sibling directory of each consumer.
+# The consumer path-depends on `../bilbycast-gateway-sdk`, so the checkout
+# layout has to put the SDK in a sibling directory of it.
+#
+# The second consumer, bilbycast-gateway-template, is covered by its own CI
+# rather than here — see the comment on the `consumers` job for why a public
+# repo must not check out a private one.
 
 on:
   pull_request:
@@ -59,11 +62,29 @@ jobs:
   consumers:
     name: consumers build against this SDK
     runs-on: ubuntu-24.04
+    # Only the PUBLIC consumer is built here, and that is a deliberate limit,
+    # not an oversight.
+    #
+    # `GatewayConfig` has two exhaustive-literal consumers —
+    # bilbycast-appear-x-api-gateway (public) and bilbycast-gateway-template
+    # (private). This repo is public, so `actions/checkout` with the default
+    # GITHUB_TOKEN cannot read the private one: the first run failed here with
+    # "Not Found", which is how GitHub reports "no access" for a private repo.
+    #
+    # The fix is NOT to hand this job a PAT. Workflow logs on a public repo are
+    # publicly readable, and a compile error prints the offending source lines —
+    # so checking a private repo out here would publish private source to
+    # anyone who opens the run. The template's half of the guard lives in the
+    # template's own repo instead (private -> public is free, no secret), which
+    # gives the same protection from the other side.
+    #
+    # Coverage is not lost for the class this job exists to catch: appear-x
+    # builds the same exhaustive `GatewayConfig` literal, so a new required
+    # field fails right here.
     strategy:
       fail-fast: false
       matrix:
         consumer:
-          - bilbycast-gateway-template
           - bilbycast-appear-x-api-gateway
     steps:
       # Both consumers path-depend on `../bilbycast-gateway-sdk`, so lay the
