@@ -101,10 +101,18 @@ fn build_pinned_config(fingerprint: &str) -> Result<ClientConfig, SdkError> {
 
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Build the standard webpki verifier ONCE, here, and keep it: the pinned
+    // verifier delegates chain validation *and* the CertificateVerify
+    // signature checks to it. Building it inside `verify_server_cert` (as an
+    // earlier version did) leaves the signature callbacks with nothing to
+    // delegate to, which is how they came to assert validity unchecked.
+    let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| SdkError::Tls(format!("failed to build certificate verifier: {e}")))?;
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
-            roots: root_store,
+            inner,
             expected_fingerprint: fp,
         }))
         .with_no_client_auth();
@@ -178,9 +186,16 @@ impl ServerCertVerifier for InsecureCertVerifier {
 }
 
 /// Verifier that validates chain normally AND pins to a SHA-256 fingerprint.
+///
+/// Every check other than the fingerprint pin is delegated to `inner`, the
+/// standard webpki verifier — including the two `CertificateVerify`
+/// signature callbacks. That delegation is load-bearing: certificates are
+/// public, so an on-path attacker can replay the real manager's leaf (chain
+/// validates, fingerprint matches) and only the CertificateVerify signature
+/// proves possession of the matching private key.
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    roots: rustls::RootCertStore,
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
     expected_fingerprint: String,
 }
 
@@ -196,10 +211,8 @@ impl ServerCertVerifier for PinnedCertVerifier {
         // 1. Chain validation against webpki roots. Pinning ADDS to, not
         //    replaces, standard validation — otherwise a correct fingerprint
         //    would bypass expiry and name checks.
-        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(self.roots.clone()))
-            .build()
-            .map_err(|e| RustlsError::General(format!("failed to build webpki verifier: {e}")))?;
-        verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
 
         // 2. Fingerprint check.
         let fp = fingerprint_hex_colons(end_entity.as_ref());
@@ -216,24 +229,24 @@ impl ServerCertVerifier for PinnedCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.inner.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.inner.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        ALL_SCHEMES.to_vec()
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -280,6 +293,83 @@ mod tests {
     #[test]
     fn fingerprint_normalisation_rejects_bad_length() {
         assert!(normalise_fingerprint("deadbeef").is_err());
+    }
+
+    /// A P-256 leaf certificate (same fixture the upgrade chain tests use).
+    /// Only its SPKI matters here — we never chain-validate it.
+    const LEAF_PEM: &str = concat!(
+        "MIIBbDCCARKgAwIBAgIUack56LkOqBV3bH7TCvFYEhf+oHIwCgYIKoZIzj0EAwIw",
+        "GTEXMBUGA1UEAwwOVGVzdCBGdWxjaW8gQ0EwHhcNMjYwNzA2MDI1ODMxWhcNMjcw",
+        "NzA2MDI1ODMxWjAPMQ0wCwYDVQQDDARsZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0D",
+        "AQcDQgAEAXclNg9sf5hNuqiqxe4voL5sXVi8pccpprcDpueQIvp4j4KHv5wza7LT",
+        "ykGo4FRVpx6Zggk0rN/Sca7siAFkv6NCMEAwHQYDVR0OBBYEFNCUvLZDwM0sxQYH",
+        "toVAKni9r/t+MB8GA1UdIwQYMBaAFHtikya5y+JL+so1++HmdCdh5Qu8MAoGCCqG",
+        "SM49BAMCA0gAMEUCIGoE4eNGJB2BSBR6+IFNlakoKcEPB66LyXOnGWX/EDonAiEA",
+        "zXkAMcVKpLiuTmuWzC/vuzBmQpdkQ6UW+fVqx7oOkQQ=",
+    );
+
+    fn test_pinned_verifier() -> PinnedCertVerifier {
+        install_default_crypto_provider_once();
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("build webpki verifier");
+        PinnedCertVerifier {
+            inner,
+            expected_fingerprint: normalise_fingerprint(&"ab".repeat(32)).unwrap(),
+        }
+    }
+
+    /// Wire-encode a `DigitallySignedStruct` (u16 scheme, u16 length, sig).
+    fn dss(scheme: SignatureScheme, sig: &[u8]) -> DigitallySignedStruct {
+        use rustls::internal::msgs::codec::{Codec, Reader};
+        let mut wire = Vec::new();
+        scheme.encode(&mut wire);
+        wire.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        wire.extend_from_slice(sig);
+        DigitallySignedStruct::read(&mut Reader::init(&wire)).expect("decode dss")
+    }
+
+    /// Regression test for the CertificateVerify bypass: both signature
+    /// callbacks used to return `assertion()` unconditionally, so an on-path
+    /// attacker replaying the manager's (public) certificate completed the
+    /// handshake without ever holding the private key. A forged signature
+    /// must now be rejected.
+    #[test]
+    fn pinned_verifier_rejects_forged_handshake_signature() {
+        use base64::Engine;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(LEAF_PEM)
+            .expect("fixture is base64");
+        let cert = CertificateDer::from(der);
+        let verifier = test_pinned_verifier();
+        let bogus = dss(SignatureScheme::ECDSA_NISTP256_SHA256, &[0u8; 64]);
+
+        assert!(
+            verifier
+                .verify_tls13_signature(b"transcript", &cert, &bogus)
+                .is_err(),
+            "TLS 1.3 CertificateVerify must be checked, not asserted"
+        );
+        assert!(
+            verifier
+                .verify_tls12_signature(b"transcript", &cert, &bogus)
+                .is_err(),
+            "TLS 1.2 CertificateVerify must be checked, not asserted"
+        );
+    }
+
+    /// The pinned verifier must advertise the schemes its inner verifier can
+    /// actually check — advertising a scheme it cannot verify would make the
+    /// server pick one and then fail every handshake.
+    #[test]
+    fn pinned_verifier_schemes_come_from_inner() {
+        let verifier = test_pinned_verifier();
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            verifier.inner.supported_verify_schemes()
+        );
     }
 
     #[test]
