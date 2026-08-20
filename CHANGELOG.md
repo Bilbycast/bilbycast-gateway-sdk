@@ -6,6 +6,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Not yet cut into a version: the crate is still `version = "0.9.0"`, which was
+set before the fixes below landed. A consumer pinning `0.9.0` therefore cannot
+tell from the version alone whether it has the working checks or the no-ops —
+pin the git revision until the next bump.
+
+### Security
+
+- **Sigstore verification of the upgrade manifest was a no-op and is now
+  implemented.** `verify_cert_and_rekor` loaded the trust root and discarded
+  it, leaving only a signature check against the public key embedded in the
+  certificate the *upgrade server* supplied — and the `ALLOWED_SIGNERS`
+  identity allowlist read its issuer / repo / ref OID extensions out of that
+  same unauthenticated certificate. Minting a keypair, self-signing a
+  certificate carrying the allowlisted strings and signing your own manifest
+  passed every check: arbitrary code execution as the gateway service user,
+  which is precisely the actor Sigstore keyless is deployed to defeat. The
+  edge's working implementation is now ported over — Fulcio chain validation,
+  the leaf's validity window checked against the Rekor integrated time, the
+  Rekor body bound to *this* manifest and *this* certificate, and the Rekor
+  SET signature. Rekor inclusion is mandatory; a bundle without it is refused.
+- **`pem_to_der` now accepts the encoding `cosign` actually writes.**
+  `cosign sign-blob --bundle` emits the `cert` field as base64-of-PEM, and the
+  raw-PEM-only reader rejected every genuine bundle before a signature was
+  checked. Both encodings are accepted; a corrupt PEM block is still an error
+  rather than a silent base64 retry.
+- **The pinned-certificate TLS verifier never checked CertificateVerify.**
+  `verify_tls12_signature` and `verify_tls13_signature` returned
+  `HandshakeSignatureValid::assertion()` without looking. Certificates are
+  public, so an on-path attacker could replay the real manager's leaf: chain
+  validation passes, the fingerprint pin matches, and the one step that proves
+  possession of the private key was never evaluated — after which the sidecar
+  sends its node secret to the attacker. `PinnedCertVerifier` now holds a
+  `WebPkiServerVerifier`, built once in `build_pinned_config`, and delegates
+  chain validation, both signature callbacks and `supported_verify_schemes` to
+  it, keeping only the fingerprint comparison as this crate's own logic.
+  Delegation rather than a hand-rolled check because correct verification is
+  scheme-dependent and TLS 1.3 has curve-binding semantics rustls does not
+  enforce for you. `InsecureCertVerifier` is untouched — asserting everything
+  is the intended behaviour of the double-keyed `accept_self_signed_cert`
+  escape hatch.
+
 ## [0.9.0]
 
 ### Changed — SOURCE BREAKING
