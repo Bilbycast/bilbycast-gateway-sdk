@@ -4,12 +4,16 @@ All notable changes to `bilbycast-gateway-sdk` are recorded here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-08-21
 
-Not yet cut into a version: the crate is still `version = "0.9.0"`, which was
-set before the fixes below landed. A consumer pinning `0.9.0` therefore cannot
-tell from the version alone whether it has the working checks or the no-ops —
-pin the git revision until the next bump.
+Cut so that the version distinguishes the working checks from the no-ops: a
+consumer pinning `0.9.0` gets a Sigstore verifier that does nothing and a TLS
+pin that never checks `CertificateVerify`. Pin `0.10.0` or later.
+
+**Breaking:** `GatewayConfig` gains the required field `allow_plaintext_ws`.
+Both in-tree consumers set it (`bilbycast-appear-x-api-gateway`,
+`bilbycast-gateway-template`); a vendor sidecar constructing the struct as an
+exhaustive literal must add it. `false` is the production value.
 
 ### Security
 
