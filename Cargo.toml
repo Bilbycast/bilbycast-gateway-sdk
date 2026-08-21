@@ -1,33 +1,33 @@
 [package]
 name = "bilbycast-gateway-sdk"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "SDK for building 3rd-party device gateway sidecars that integrate with bilbycast-manager"
 publish = false
 
 [dependencies]
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
-rustls = "0.23.40"
-webpki-roots = "1.0.7"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+rustls = "0.23.43"
+webpki-roots = "1.0.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tracing = "0.1.44"
-chrono = { version = "0.4.44", features = ["serde"] }
-anyhow = "1.0.102"
-async-trait = "0.1.89"
-tokio-util = { version = "0.7.18", features = ["rt"] }
-tokio-stream = "0.1.18"
-futures-util = "0.3.32"
-thiserror = "2.0.18"
+chrono = { version = "0.4.45", features = ["serde"] }
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-stream = "0.1.19"
+futures-util = "0.3.34"
+thiserror = "2.0.20"
 url = "2.5.8"
-bytes = "1.11.1"
+bytes = "1.12.1"
 sha2 = "0.11.0"
 hex = "0.4.3"
-toml = "1.1.2"
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream"] }
-base64 = "0.23.0"
+toml = "1.1.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+base64 = "0.23.1"
 
 # ── Remote upgrade plumbing (mirror of bilbycast-edge/src/upgrade/) ──────
 # Parameterised by `(repo, binary_name, install_root, allowed_signers)`

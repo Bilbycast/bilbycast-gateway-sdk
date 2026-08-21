@@ -4,6 +4,28 @@ All notable changes to `bilbycast-gateway-sdk` are recorded here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-08-21
+
+### Changed
+
+- Dependency freshness pass, no API change. Every version string that had
+  fallen behind its newest release moves to it: tokio 1.53.1, rustls 0.23.43,
+  webpki-roots 1.0.9, serde 1.0.229, serde_json 1.0.151, chrono 0.4.45, anyhow
+  1.0.104, async-trait 0.1.92, tokio-util 0.7.19, tokio-stream 0.1.19,
+  futures-util 0.3.34, thiserror 2.0.20, bytes 1.12.1, base64 0.23.1, toml
+  1.1.4 and reqwest 0.13.4. Every one of these was already the resolved
+  version; the manifest was the thing behind.
+- `x509-cert` stays held at 0.2 and the reason was re-checked rather than
+  assumed. sigstore 0.14.0 is still the latest release, still requires `^0.2`,
+  and its git main is still on `^0.2`; the upstream dependabot PR attempting
+  0.3 has been open a month with red CI. x509-cert 0.3 also made the
+  certificate structs opaque, so it is a hard break for `upgrade::verify`
+  independently of sigstore.
+
+The 0.10.0 guidance below is unchanged and still applies: a consumer pinning
+`0.9.0` gets a Sigstore verifier that does nothing and a TLS pin that never
+checks `CertificateVerify`.
+
 ## [0.10.0] - 2026-08-21
 
 Cut so that the version distinguishes the working checks from the no-ops: a
