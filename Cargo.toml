@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-gateway-sdk"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "SDK for building 3rd-party device gateway sidecars that integrate with bilbycast-manager"
@@ -25,7 +25,7 @@ url = "2.5.8"
 bytes = "1.12.1"
 sha2 = "0.11.0"
 hex = "0.4.3"
-toml = "1.1.4"
+toml = "1.1.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 base64 = "0.23.1"
 
