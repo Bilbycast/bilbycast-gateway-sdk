@@ -484,6 +484,9 @@ decision, not a missing feature.
 | `GatewayClient::run` | Enter the connect/reconnect loop (blocks until shutdown). |
 | `GatewayClient::emitter()` | Get an emitter for stats / events / health. |
 | `GatewayClient::shutdown_token()` | Cancel to trigger graceful shutdown. |
+| `GatewayClient::connection_state()` | Cloneable, lock-free `ConnectionState` handle. Clone it **before** `run()` and read `is_connected()` / `last_connect_epoch()` from an HTTP `/health` handler, a local UI or a status-LED task to surface manager-link up/down on the box itself — no manager-protocol change involved. The connect/reconnect loop writes it: connected on successful auth, disconnected when the session ends or a connect attempt fails. |
+| `GatewayClient::is_connected()` | Shorthand for `connection_state().is_connected()`. |
+| `GatewayClient::current_credentials()` | `(Option<String>, Option<String>)` snapshot of the live `(node_id, node_secret)`. `None` values mean registration has not completed yet. |
 | `GatewayClient::on_register(cb)` | Callback fired on first-time registration. |
 | `Emitter::emit_stats` / `emit_event` / `emit_health` | The hot-path outputs. |
 | `Emitter::emit_health_with_target` | Health heartbeat plus typed `gateway_target` sub-status (target reachability, gateway host / egress IP). Drives the manager's third "Target down" amber dashboard state and the per-driver Gateway Module header. |
@@ -714,8 +717,24 @@ Conventions:
   alarm-storm scenarios.
 - **Config-template enforcement**, managed-flow push-status tracking,
   tunnel reconciliation, etc. Those are manager-side concepts driven by
-  the `DeviceDriver` implementation in `manager-core/src/drivers/`, not
-  by the gateway itself.
+  your device type's `DeviceDriver` plugin crate
+  (`bilbycast-manager/crates/device-<name>/`) — `manager-core/src/drivers/mod.rs`
+  holds the trait, the `DriverRegistry` and the contract types they share,
+  and no per-device implementation — not by the gateway itself.
+- **Wizard registration — exported, but not wired.** `WizardHandler`,
+  `WizardDescriptor`, `WizardField`, `WizardFieldKind`,
+  `WizardSelectOption`, `PlanStep` and `NoWizards` are re-exported from
+  the crate root, but nothing constructs, serialises or dispatches them:
+  `envelope::auth_register` carries no `wizards` field, no module outside
+  `lib.rs` references the module, and the manager's node hub never reads a
+  `wizards` field off a node either. Implementing `WizardHandler` today is
+  a no-op on both ends, and there is no command to intercept instead:
+  `wizard_preview` / `wizard_apply` exist nowhere but `src/wizards.rs`'s
+  module doc, which still describes the intended routing as if it were
+  wired. A wizard for your device type is declared manager-side by
+  `DeviceDriver::wizards()` in its plugin crate; `services::run_plan` then
+  sends each `PlanStep.action` to the node as an ordinary command, so what
+  the gateway needs is a `CommandHandler::handle_command` arm per action.
 - **TOML parsing.** Consumers own their `config.toml` schema. The SDK's
   `GatewayConfig` is serde-compatible, so you can embed it verbatim
   under a `[manager]` section.

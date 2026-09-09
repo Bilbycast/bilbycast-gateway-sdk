@@ -124,23 +124,45 @@ BILBYCAST_ALLOW_INSECURE=1 ./my-gateway --config config.toml
 Pure Rust, no OpenSSL. Pinned to match the Appear X reference gateway's
 versions:
 
-Versions track `Cargo.toml`; see it for exact patch pins.
+Minor versions drift as the workspace is swept; `Cargo.toml` is authoritative.
 
 | crate | version |
 |---|---|
-| tokio | 1.52 |
-| tokio-tungstenite | 0.29 (rustls-tls-webpki-roots) |
+| tokio | 1.53 |
+| tokio-tungstenite | 0.30 (rustls-tls-webpki-roots) |
 | rustls | 0.23 |
 | webpki-roots | 1.0 |
 | serde / serde_json | 1.0 |
 | chrono | 0.4 |
 | async-trait | 0.1 |
 | tokio-util | 0.7 |
+| tokio-stream | 0.1 |
 | futures-util | 0.3 |
 | thiserror | 2.0 |
 | url | 2.5 |
-| bytes | 1.11 |
+| bytes | 1.12 |
 | sha2 | 0.11 |
+| hex | 0.4 |
+| toml | 1.1 |
+| reqwest | 0.13 (`default-features = false`, rustls + stream) |
+| base64 | 0.23 |
+
+Remote-upgrade plumbing (`src/upgrade/`, the mirror of
+`bilbycast-edge/src/upgrade/`) pulls in the rest of the graph:
+
+| crate | version |
+|---|---|
+| tar | 0.4 |
+| flate2 | 1.1 (`rust_backend` — no zlib C) |
+| semver | 1.0 |
+| fs2 | 0.4 |
+| sigstore | 0.14 (`default-features = false`, sigstore-trust-root + cached-client) |
+| x509-cert | 0.2 |
+
+`x509-cert` is **held at 0.2 deliberately**, not stale: 0.3 is out, but
+sigstore 0.14 still requires `^0.2`, so bumping ours alone resolves both into
+the graph and puts a second X.509 parser in the release-signature verification
+path. Move it in lockstep with sigstore, never ahead of it.
 
 ## Licensing
 
