@@ -41,11 +41,32 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a commit, not `@stable`. dtolnay/rust-toolchain is
+        # versioned by branch, not tag, and `stable` is an unprotected branch
+        # its maintainer force-pushes about once a month (master plus one
+        # commit), so `@stable` ran whatever that branch held on the day of
+        # the run. This is the commit `stable` held on 2026-09-25.
+        #
+        # Only the action's code is pinned. `toolchain: stable` still installs
+        # the current stable Rust, as before; it is spelled out because the
+        # input defaults to `stable` only on the `stable` branch, and is
+        # required on a `master` commit.
+        #
+        # To bump: `gh api repos/dtolnay/rust-toolchain/branches/stable --jq
+        # .commit.sha`, read the diff from the SHA below, and replace it here
+        # and in the `consumers` job. Nothing bumps this automatically (this
+        # repo has no Dependabot), and an old SHA keeps resolving, so a stale
+        # pin still builds.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
         with:
+          toolchain: stable
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the `v2` tag points at, which is v2.9.2. A tag
+      # can be moved; a commit cannot. To bump: pick the new release tag,
+      # `gh api repos/Swatinem/rust-cache/commits/<tag> --jq .sha`, and
+      # replace the SHA and the comment here and in the `consumers` job.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo check
         run: cargo check --all-targets
@@ -100,10 +121,13 @@ jobs:
         with:
           path: bilbycast-gateway-sdk
 
+      # Both pins: see the `check` job for why and how to bump.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ matrix.consumer }}
 
