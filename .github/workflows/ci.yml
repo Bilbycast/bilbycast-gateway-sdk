@@ -39,6 +39,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Nothing in this workflow pushes, and without this the job's token
+          # stays in .git/config for every later step, where every
+          # dependency's build.rs and proc-macro runs.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         # Pinned to a commit, not `@stable`. dtolnay/rust-toolchain is
@@ -110,16 +115,23 @@ jobs:
     steps:
       # Both consumers path-depend on `../bilbycast-gateway-sdk`, so lay the
       # tree out as `work/<consumer>` + `work/bilbycast-gateway-sdk`.
+      #
+      # The consumer is deliberately NOT pinned to a commit: this job exists
+      # to build the consumer's current `main` against the SDK under test.
+      # Neither checkout keeps a credential, since nothing here pushes and
+      # the consumer's own build.rs and dependencies run after them.
       - name: Checkout ${{ matrix.consumer }}
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/${{ matrix.consumer }}
           path: ${{ matrix.consumer }}
+          persist-credentials: false
 
       - name: Checkout this SDK as the sibling path dependency
         uses: actions/checkout@v7
         with:
           path: bilbycast-gateway-sdk
+          persist-credentials: false
 
       # Both pins: see the `check` job for why and how to bump.
       - name: Install Rust toolchain
