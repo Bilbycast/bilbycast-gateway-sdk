@@ -541,6 +541,15 @@ for the trust model.
        allowed_signers: MY_SIGNERS,
    };
    ```
+   `AllowedSigner.repo` is the URL form (`UpgradeProfile.repo` stays bare
+   `owner/repo`: it builds the release download URL). The verifier reads it
+   from Fulcio's `Source Repository URI` extension (`.1.12`), falling back
+   to the deprecated `.1.5` (bare `owner/repo`) with `https://github.com/`
+   put in front. SDK 0.10.0 to 0.10.4 compared `.1.5` with it directly and
+   refused every genuine release (earlier SDKs failed before the comparison),
+   so a sidecar built on one has to be moved to a fixed release once by hand
+   — its installer's `--upgrade-installer`, then a service restart — before
+   manager-driven upgrades work.
 
 2. **Open an event channel** and **run the boot watchdog before any
    other init**, so a crash-loop on a freshly-staged binary triggers
@@ -657,10 +666,14 @@ should:
    keyless — no long-lived signing key). Add `id-token: write` to the
    workflow's `permissions:` block.
 
-4. **Self-verify** the signature with `cosign verify-blob` against
-   your `ALLOWED_SIGNERS` regex BEFORE publishing the release. This
-   catches any mismatch between the workflow path and the allowlist
-   here, not in production rollback territory.
+4. **Self-verify** the signature with `cosign verify-blob` and an
+   identity regexp for your workflow BEFORE publishing the release. That
+   is cosign's matcher, not the SDK's `upgrade::verify`: it proves the
+   signature and the workflow identity, and cannot see whether your
+   compiled-in `ALLOWED_SIGNERS` would accept them — every gateway on SDK
+   0.10.0 to 0.10.4 refused every genuine release while this step passed.
+   Pin that with a unit test that feeds a real release certificate through
+   the verifier against your allowlist, as the SDK's own tests do.
 
 5. Add `manifest.json`, `manifest.sig.bundle`, and the standalone
    install / uninstall / service unit files to the release alongside

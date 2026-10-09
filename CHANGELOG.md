@@ -4,6 +4,31 @@ All notable changes to `bilbycast-gateway-sdk` are recorded here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`upgrade::verify` refused every genuine release.** The identity check read
+  the repository from Fulcio's deprecated `GitHub Workflow Repository`
+  extension (OID `1.3.6.1.4.1.57264.1.5`), which holds bare `owner/repo`, and
+  compared it with an `AllowedSigner.repo` that holds
+  `https://github.com/owner/repo` — the form the field's own documentation asks
+  for. No real certificate could match, so every manager-driven
+  `upgrade_binary` failed with `upgrade_identity_not_allowed`. It failed
+  closed. Claims are now read from the current extensions (`.1.8` issuer,
+  `.1.12` source repository URI, `.1.14` ref — DER `UTF8String`), falling back
+  to the deprecated `.1.1` / `.1.5` / `.1.6` (with `https://github.com/` put in
+  front of `.1.5`). No consumer's allowlist changes. A sidecar built on 0.10.0
+  to 0.10.4 carries the broken check (earlier SDKs failed before it, on
+  cosign's base64-of-PEM cert), so it has to be moved to a fixed release once
+  by hand: its installer's `--upgrade-installer`, then a service restart.
+- The SAN workflow match now requires `@` straight after the allowlisted
+  workflow path, so `nightly-release.yml.evil.yml@…` no longer passes as
+  `nightly-release.yml`.
+- Tests now feed real Fulcio certificates (`src/upgrade/testdata/`) through
+  `extract_identity_claims`; every earlier test built a `CertIdentity` by hand,
+  already in URL form, which is how the defect went unseen.
+
 ## [0.10.1] - 2026-08-21
 
 ### Changed
