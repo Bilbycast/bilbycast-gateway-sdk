@@ -947,9 +947,12 @@ enum Inbound {
 /// it is read, whatever the writes are doing.
 ///
 /// Text, a Close, an error or the end of the stream go to the session loop in
-/// the order they were read, so the commands a manager sent before closing
-/// are still handled; a Ping goes over as a request for a Pong. A text frame
-/// waits for its share of `budget` first, so a loop held up in a write holds
+/// the order they were read, and a Ping goes over as a request for a Pong.
+/// The order has the loop route a command before it ends the session on what
+/// was read after it, but routing is not running: the worker starts nothing
+/// for a session that has ended (see [`run_commands`]), so a command read in
+/// the same burst as the end is dropped unrun. A text frame waits for its
+/// share of `budget` first, so a loop held up in a write holds
 /// up the reading once that many bytes are waiting for it, rather than once
 /// the channel's count is. Returns only when the manager has been silent past
 /// its limit, as `(silent, limit)`. Every other end of the session is the
@@ -1227,6 +1230,12 @@ struct QueuedCommand {
 /// Commands still queued when the session ends are not started. The manager
 /// hears nothing back for them on that session and treats them as failed;
 /// running them anyway would change the device behind the operator's back.
+/// That includes a command read in the same burst as the manager's Close or
+/// the end of the stream, which the old inline loop ran before it read the
+/// end. Running those would take draining the queue at a clean end, which
+/// would also run every command waiting behind a long one, long after the
+/// manager gave up on them; and the manager's own way of ending a session
+/// like that is deleting the node, after which nobody reads the ack.
 async fn run_commands(
     turn: Arc<Semaphore>,
     mut queue: mpsc::Receiver<QueuedCommand>,

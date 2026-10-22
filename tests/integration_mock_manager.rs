@@ -32,6 +32,8 @@
 //!   and the commands of the sessions that ended never run
 //! - shutdown while a command runs → `run()` waits for it, up to 30 s, and
 //!   starts nothing queued behind it
+//! - a command read together with the manager's Close → dropped unrun, like
+//!   any command still queued when its session ends
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1328,6 +1330,36 @@ async fn commands_past_the_queue_byte_budget_are_answered_busy() {
     let ran = acks.iter().filter(|(_, a)| a["success"] == true && a["command_id"] != "slow-1");
     assert_eq!(ran.count() + busy.len(), 10, "one ack per command");
     assert!(busy.len() < 10, "the queue must still take what fits in its bytes");
+
+    stop(run_task, shutdown).await;
+}
+
+/// A command and the manager's Close read together. The loop routes the
+/// command to the worker before the Close ends the session, but the worker
+/// starts nothing for a session that has ended, so the command is dropped
+/// like any other still queued: it never runs, and no ack for it reaches the
+/// next session. The old inline loop ran it before it read the Close; this
+/// pins the change, so that undoing it is a decision.
+#[tokio::test]
+async fn a_command_read_with_the_close_is_dropped_unrun() {
+    let command_then_close = Behaviour::Burst {
+        frames: vec![
+            Message::Text(command("echo-1", json!({ "type": "echo" })).to_string().into()),
+            Message::Close(None),
+        ],
+    };
+    let (url, log) = spawn_link_mock(vec![command_then_close]).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, _emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(10), || log.auths().len() >= 2).await,
+        "the gateway should reconnect"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(handler.started().is_empty(), "the command read with the Close ran");
+    assert!(log.ack("echo-1").is_none(), "the command read with the Close was acked");
 
     stop(run_task, shutdown).await;
 }
