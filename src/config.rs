@@ -214,7 +214,9 @@ fn plaintext_ws_env_set() -> bool {
 }
 
 /// Reconnect backoff policy. Exponential 1 s → 2 s → 5 s → 10 s → 30 s by default,
-/// reset on a successful auth.
+/// reset when an authenticated session is closed cleanly (not when it is lost to
+/// an error, the silence watchdog or the write bound). A successful auth alone
+/// does not reset it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReconnectBackoff {
     pub steps_secs: Vec<u64>,
