@@ -171,12 +171,13 @@ starts only once the previous session's worker has finished.
   `command_ack` (`error_code = "gateway_busy"`) and is not run.
 - **A command that has started always finishes.** If the session ends while
   it runs, it completes and its ack goes out on the next session. At
-  shutdown, `run()` waits up to 30 s for it before returning, and its ack is
-  not sent. Commands still waiting when a session ends are dropped without
-  an ack, even one that arrived in the same read as the end of the session:
-  the manager gets nothing back for them on that session and counts them
-  failed, so running them later would change the device behind the
-  operator's back.
+  shutdown, `run()` waits up to 30 s for it before returning; its ack is not
+  sent, and anything it emits meanwhile fails, so a handler that emits
+  progress should not give up on an emit error. Commands still waiting when
+  a session ends are dropped without an ack, even one that arrived in the
+  same read as the end of the session: the manager gets nothing back for
+  them on that session and counts them failed, so running them later would
+  change the device behind the operator's back.
 - **A panic costs one command, not the gateway.** The manager gets a failed
   ack with `error_code = "handler_panicked"`, and the next command runs.
 - **A handler that never returns stops every command after it.** The link

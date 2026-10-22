@@ -369,7 +369,8 @@ impl GatewayClient {
 
     /// Run the connect/reconnect loop until shutdown is requested. A command
     /// that has started by then is given up to 30 s to finish before this
-    /// returns; its ack is not sent, as no session is left to carry it.
+    /// returns. Its ack is not sent, as no session is left to carry it, and
+    /// from the moment the loop ends every [`Emitter`] send fails.
     pub async fn run(mut self) -> Result<(), SdkError> {
         let mut url_cursor: usize = 0;
         let mut attempt: u32 = 0;
