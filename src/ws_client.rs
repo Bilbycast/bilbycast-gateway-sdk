@@ -36,7 +36,8 @@
 //!   session loop: a long vendor command would otherwise stop the reader, and
 //!   its `command_ack` would wait on the outbound channel only that parked
 //!   loop drains.
-//! - **Shutdown** — 2 s to write the Close frame.
+//! - **Shutdown** — 2 s to write the Close frame, then up to 30 s for a
+//!   command already running to finish.
 
 use futures_util::stream::{FuturesUnordered, SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -129,6 +130,12 @@ const WRITE_STALL_LIMIT: Duration = Duration::from_secs(300);
 /// Bound on the Close frame written at shutdown. A manager that has stopped
 /// reading would otherwise hold SIGTERM up until systemd's SIGKILL.
 const CLOSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long `run()` waits at shutdown for a command that has already
+/// started, so that stopping the gateway does not cut a vendor command off
+/// part-way through a change. Bounded like every other await here, so a
+/// handler that never returns cannot hold shutdown up for ever.
+const COMMAND_DRAIN_LIMIT: Duration = Duration::from_secs(30);
 
 /// Frames the reader has handed the session loop that the loop has not yet
 /// taken. Only a loop held up in a write lets this fill.
@@ -340,7 +347,9 @@ impl GatewayClient {
         (guard.node_id.clone(), guard.node_secret.clone())
     }
 
-    /// Run the connect/reconnect loop until shutdown is requested.
+    /// Run the connect/reconnect loop until shutdown is requested. A command
+    /// that has started by then is given up to 30 s to finish before this
+    /// returns; its ack is not sent, as no session is left to carry it.
     pub async fn run(mut self) -> Result<(), SdkError> {
         let mut url_cursor: usize = 0;
         let mut attempt: u32 = 0;
@@ -403,6 +412,23 @@ impl GatewayClient {
                 _ = tokio::time::sleep(delay) => {}
                 _ = self.shutdown.cancelled() => break,
             }
+        }
+
+        // Let a command that has started finish, or the runtime's teardown
+        // could cut it off part-way through a change. It may belong to an
+        // earlier session (shutdown can come during the backoff or a dial),
+        // so wait for the command turn rather than for this session's worker:
+        // every session is over, so no worker starts another command, and the
+        // one running gives the turn up when it returns. Nothing drains the
+        // outbound channel any more, so close it first: the command's ack,
+        // and any vendor emit, then fails at once instead of waiting for room
+        // that never comes.
+        self.outbound_rx.close();
+        if tokio::time::timeout(COMMAND_DRAIN_LIMIT, self.command_turn.acquire()).await.is_err() {
+            warn!(
+                "Gateway SDK: a command was still running {}s after shutdown; abandoning it",
+                COMMAND_DRAIN_LIMIT.as_secs()
+            );
         }
 
         info!("Gateway SDK: shutdown complete");
@@ -1134,7 +1160,8 @@ impl QueuedCommand {
 /// still running when its session ended (an `upgrade_binary` fetching a
 /// tarball, say) completes before the next session's first command starts. A
 /// command that has started always runs to completion and its ack goes out on
-/// whichever session is up by then.
+/// whichever session is up by then. At shutdown, `run()` waits up to
+/// [`COMMAND_DRAIN_LIMIT`] for it instead, and its ack is not sent.
 ///
 /// Commands still queued when the session ends are not started. The manager
 /// hears nothing back for them on that session and treats them as failed;

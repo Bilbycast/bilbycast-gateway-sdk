@@ -29,8 +29,9 @@ their polling loop and their [`CommandHandler`](src/dispatch.rs).
     sidecar offline: a 30 s dial deadline (DNS, TCP, TLS and the upgrade,
     with Happy-Eyeballs across the manager's addresses), 10 s each to send
     the auth frame and to get the reply, a silence watchdog learned from the
-    manager's pings (never under 90 s), a 300 s bound on every write and 2 s
-    for the Close at shutdown
+    manager's pings (never under 90 s), a 300 s bound on every write, 2 s
+    for the Close at shutdown and up to 30 s for a command already running
+    to finish
   - Commands run on a worker task, one at a time, never inside the session
     loop, so a long command does not stop the link answering the manager;
     past 64 queued, a command is refused at once with `gateway_busy`

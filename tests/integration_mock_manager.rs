@@ -29,6 +29,7 @@
 //!   the next session, and that session's commands wait for it
 //! - reconnects behind a command that never returns → no pile-up of workers,
 //!   and the commands of the sessions that ended never run
+//! - shutdown while a command runs → `run()` waits for it, up to 30 s
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -542,6 +543,8 @@ enum Behaviour {
     CommandsThenPing { commands: Vec<Value> },
     /// Never read again; ping every [`PING_EVERY`].
     PingButNeverRead,
+    /// Send these envelopes, then as [`Behaviour::PingButNeverRead`].
+    CommandsThenStopReading { commands: Vec<Value> },
     /// Read everything, send nothing.
     Quiet,
     /// Send these frames in a single write, so the gateway reads them
@@ -635,7 +638,10 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
     }
     log.auths.lock().unwrap().push(Instant::now());
 
-    let reads = !matches!(behaviour, Behaviour::PingButNeverRead);
+    let reads = !matches!(
+        behaviour,
+        Behaviour::PingButNeverRead | Behaviour::CommandsThenStopReading { .. }
+    );
     let reader = async {
         if !reads {
             return std::future::pending().await;
@@ -656,7 +662,8 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
     let writer = async {
         let (pings, every) = match behaviour {
             Behaviour::PingThenSilent { count } => (count, Duration::from_secs(1)),
-            Behaviour::CommandsThenPing { commands } => {
+            Behaviour::CommandsThenPing { commands }
+            | Behaviour::CommandsThenStopReading { commands } => {
                 for command in commands {
                     if write.send(Message::Text(command.to_string().into())).await.is_err() {
                         return;
@@ -1159,4 +1166,74 @@ async fn reconnects_behind_a_hung_command_do_not_pile_up_workers() {
     );
 
     stop(run_task, shutdown).await;
+}
+
+/// Shutdown while a command runs. The command used to run inside the session
+/// loop, so shutdown waited for it; once it moved to a worker, `run()`
+/// returned within the 2 s Close bound, and a sidecar's `main` returning
+/// right after it tore the runtime down with the command part-way through.
+/// Now `run()` returns once the command has finished, and promptly then,
+/// even against a manager that has stopped reading while the vendor's frames
+/// fill the outbound channel, where the command's ack has nowhere to go.
+#[tokio::test]
+async fn shutdown_lets_a_started_command_finish() {
+    let slow = command("slow-1", json!({ "type": "slow", "secs": 20 }));
+    let (url, log) =
+        spawn_link_mock(vec![Behaviour::CommandsThenStopReading { commands: vec![slow] }]).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    let vendor = flood(emitter);
+    first_session_then_pause_the_clock(&log).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || handler.started_at("slow-1").is_some()).await,
+        "the command should start"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(60), run_task)
+        .await
+        .expect("run() should return once the command has finished")
+        .unwrap()
+        .unwrap();
+    let returned = Instant::now();
+    let finished = handler
+        .finished_at("slow-1")
+        .expect("run() returned with the command still running, for the runtime to cut off");
+    assert!(
+        returned - finished < Duration::from_secs(1),
+        "run() returned {:?} after the command finished: its ack, waiting for room in a channel \
+         nothing drains, held shutdown up",
+        returned - finished
+    );
+    vendor.abort();
+}
+
+/// Shutdown while a command that never returns runs: `run()` waits for it
+/// for 30 s and no longer.
+#[tokio::test]
+async fn shutdown_gives_up_on_a_command_that_never_finishes() {
+    let hang = command("hang-1", json!({ "type": "hang" }));
+    let (url, log) =
+        spawn_link_mock(vec![Behaviour::CommandsThenPing { commands: vec![hang] }]).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, _emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || handler.started_at("hang-1").is_some()).await,
+        "the command should start"
+    );
+
+    shutdown.cancel();
+    let cancelled = Instant::now();
+    tokio::time::timeout(Duration::from_secs(120), run_task)
+        .await
+        .expect("run() must give up on a command that never returns")
+        .unwrap()
+        .unwrap();
+    let waited = cancelled.elapsed();
+    assert!(
+        (Duration::from_secs(30)..=Duration::from_secs(32)).contains(&waited),
+        "run() returned {waited:?} after shutdown; it should wait 30 s for the running command"
+    );
 }

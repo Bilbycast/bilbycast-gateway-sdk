@@ -36,8 +36,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reconnects too. Past 64 waiting, a command is answered at once with
   `error_code = "gateway_busy"` and not run. A command running when its
   session ends completes and is acked on the next session; queued ones are
-  dropped. A handler that panics now costs that one command, acked
-  `handler_panicked`, where the panic used to unwind out of `run()`.
+  dropped. At shutdown, `run()` waits up to 30 s for a command that has
+  started, so stopping the sidecar does not cut it off part-way through a
+  change; its ack is not sent. A handler that panics now costs that one
+  command, acked `handler_panicked`, where the panic used to unwind out of
+  `run()`.
 
 ## [0.10.5] - 2026-10-09
 
