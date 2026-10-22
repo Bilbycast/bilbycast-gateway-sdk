@@ -160,8 +160,9 @@ impl Emitter {
             .await
     }
 
-    /// Emit a `pong` in response to a manager `ping` envelope. The SDK read
-    /// task already handles this transparently; exposed for completeness.
+    /// Emit a `pong` in response to a manager `ping` envelope. The SDK's
+    /// session loop already answers a `ping` itself, so this is only for
+    /// completeness.
     pub async fn emit_pong(&self) -> Result<(), SdkError> {
         self.send_envelope("pong", Value::Null).await
     }
