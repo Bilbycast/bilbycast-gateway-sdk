@@ -174,10 +174,16 @@ starts only once the previous session's worker has finished.
   shutdown, `run()` waits up to 30 s for it before returning; its ack is not
   sent, and anything it emits meanwhile fails, so a handler that emits
   progress should not give up on an emit error. Commands still waiting when
-  a session ends are dropped without an ack, even one that arrived in the
-  same read as the end of the session: the manager gets nothing back for
-  them on that session and counts them failed, so running them later would
-  change the device behind the operator's back.
+  a session ends are dropped without an ack: the manager gets nothing back
+  for them on that session and counts them failed, so running them later
+  would change the device behind the operator's back.
+- **A command that arrives with the end of its session may or may not
+  run.** No command starts once its session has ended, and for one that
+  arrived in the same read as the end, that is all the SDK guarantees. On a
+  multi-thread runtime, which `#[tokio::main]` gives you, the worker can
+  take it before the SDK has read the end; it has then started, so it
+  finishes and its ack goes out on the next session like any other.
+  Otherwise it is dropped with the rest.
 - **A panic costs one command, not the gateway.** The manager gets a failed
   ack with `error_code = "handler_panicked"`, and the next command runs.
 - **A handler that never returns stops every command after it.** The link

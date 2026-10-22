@@ -133,7 +133,8 @@ as the starting point for your gateway's integration suite. The test exercises:
   the next session; reconnects behind a hung command pile up no workers
 - shutdown while a command runs → `run()` waits for it, up to 30 s, and starts
   nothing queued behind it
-- a command read together with the Close → dropped unrun
+- a command read together with the Close → dropped unrun, on the test's
+  current-thread runtime; on a multi-thread one the worker may take it first
 - a handler that panics → `handler_panicked`, and the next command runs
 
 The liveness cases run on tokio's paused clock, so the minutes of stall they

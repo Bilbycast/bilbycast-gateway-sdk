@@ -952,13 +952,14 @@ enum Inbound {
 /// the order they were read, and a Ping goes over as a request for a Pong.
 /// The order has the loop route a command before it ends the session on what
 /// was read after it, but routing is not running: the worker starts nothing
-/// for a session that has ended (see [`run_commands`]), so a command read in
-/// the same burst as the end is dropped unrun. A text frame waits for its
-/// share of `budget` first, so a loop held up in a write holds up the reading
-/// once that many bytes are waiting for it, rather than once the channel's
-/// count is. Returns only when the manager has been silent past its limit, as
-/// `(silent, limit)`. Every other end of the session is the loop's to report,
-/// so once it has been handed one, this parks.
+/// for a session that has ended, so a command read in the same burst as the
+/// end runs only if the worker took it before the loop reached the end, a
+/// race on a multi-thread runtime (see [`run_commands`]). A text frame waits
+/// for its share of `budget` first, so a loop held up in a write holds up the
+/// reading once that many bytes are waiting for it, rather than once the
+/// channel's count is. Returns only when the manager has been silent past its
+/// limit, as `(silent, limit)`. Every other end of the session is the loop's
+/// to report, so once it has been handed one, this parks.
 async fn read_manager<S>(
     mut read: S,
     inbound: mpsc::Sender<Inbound>,
@@ -1235,12 +1236,22 @@ struct QueuedCommand {
 /// behind a handler that never returns it would be kept for good. The manager
 /// hears nothing back for them on that session and treats them as failed;
 /// running them anyway would change the device behind the operator's back.
-/// That includes a command read in the same burst as the manager's Close or
-/// the end of the stream, which the old inline loop ran before it read the
-/// end. Running those would take draining the queue at a clean end, which
-/// would also run every command waiting behind a long one, long after the
-/// manager gave up on them; and the manager's own way of ending a session
-/// like that is deleting the node, after which nobody reads the ack.
+///
+/// The worker starts nothing once `session_over` is cancelled, which
+/// `run_session` does as soon as it has seen the end, and that is all that is
+/// guaranteed for a command read in the same burst as the manager's Close or
+/// the end of the stream. The loop hands such a command over before it reads
+/// the end, so a worker that is free can take it in between, and then it has
+/// started like any other. On a multi-thread runtime the worker runs beside
+/// the loop, and either can happen. A current-thread runtime runs the worker
+/// only when the session's task yields, which between two frames of one read
+/// it does not unless something in between waits (a write, room in a queue)
+/// or tokio's cooperative budget runs out, so there the command is normally
+/// dropped unrun. The old inline loop always ran it. Running it every time
+/// would take draining the queue at a clean end, which would also run every
+/// command waiting behind a long one, long after the manager gave up on them;
+/// and the manager's own way of ending a session like that is deleting the
+/// node, after which nobody reads the ack.
 async fn run_commands(
     turn: Arc<Semaphore>,
     mut queue: mpsc::Receiver<QueuedCommand>,

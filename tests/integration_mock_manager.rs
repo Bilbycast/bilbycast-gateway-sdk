@@ -33,7 +33,8 @@
 //! - shutdown while a command runs → `run()` waits for it, up to 30 s, and
 //!   starts nothing queued behind it
 //! - a command read together with the manager's Close → dropped unrun, like
-//!   any command still queued when its session ends
+//!   any command still queued when its session ends (on this current-thread
+//!   runtime; on a multi-thread one the worker may take it first)
 //! - a handler that panics → that command is acked `handler_panicked`, and
 //!   the next one runs
 
@@ -1344,6 +1345,14 @@ async fn commands_past_the_queue_byte_budget_are_answered_busy() {
 /// like any other still queued: it never runs, and no ack for it reaches the
 /// next session. The old inline loop ran it before it read the Close; this
 /// pins the change, so that undoing it is a decision.
+///
+/// It pins only the order a current-thread runtime gives, which is what
+/// `#[tokio::test]` runs: there the worker waits for the session's task to
+/// yield, and between the two frames of this read it does not. On a
+/// multi-thread runtime, which the consumers run, the worker runs beside the
+/// session loop and may take the command before the loop reaches the Close;
+/// then it runs and is acked on the next session. The SDK guarantees only
+/// that nothing starts once the session is over.
 #[tokio::test]
 async fn a_command_read_with_the_close_is_dropped_unrun() {
     let command_then_close = Behaviour::Burst {
