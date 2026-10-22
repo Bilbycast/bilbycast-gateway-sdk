@@ -89,7 +89,8 @@ skeleton. The minimum is:
 - `config.toml` — standard `[manager]` section plus your `[vendor]` section.
 
 That's it. The SDK handles the WebSocket protocol, TLS, auth, reconnect,
-heartbeats, and graceful shutdown.
+heartbeats, and graceful shutdown, and bounds every step of the link so a
+stalled manager cannot strand the sidecar offline (§5a).
 
 ## 3. The CommandHandler trait
 
@@ -153,6 +154,31 @@ of the node's state. The SDK intercepts this:
 Your `on_config_request()` should assemble whatever the manager UI should
 see as "the current configuration of this node" — typically a roll-up of
 your polling engine's latest snapshots.
+
+### How your handler is called
+
+The SDK never runs your handler inside the loop that reads and writes the
+socket. Each `command` goes onto a queue, and a worker task calls
+`handle_command` (or `on_config_request`) for one command at a time, in the
+order they arrived. That holds across reconnects too: a session's worker
+starts only once the previous session's worker has finished.
+
+- **A long command is fine.** An `upgrade_binary` that spends minutes
+  fetching a tarball, or a slow vendor RPC, does not stop the link reading
+  the manager's pings or sending your stats.
+- **Up to 64 commands wait behind the one running.** Past that, each new
+  command is answered at once with a failed `command_ack`
+  (`error_code = "gateway_busy"`) and is not run.
+- **A command that has started always finishes.** If the session ends while
+  it runs, it completes and its ack goes out on the next session. Commands
+  still waiting when a session ends are dropped without an ack: the manager
+  gets nothing back for them on that session and counts them failed, so
+  running them later would change the device behind the operator's back.
+- **A panic costs one command, not the gateway.** The manager gets a failed
+  ack with `error_code = "handler_panicked"`, and the next command runs.
+- **A handler that never returns stops every command after it.** The link
+  stays up, but the queue fills and the manager starts getting
+  `gateway_busy`. Put a timeout on every vendor call.
 
 ## 4. The polling engine
 
@@ -397,12 +423,68 @@ client.on_register(move |node_id, node_secret| {
 });
 ```
 
+## 5a. Staying connected
+
+A sidecar's manager link is one task, so a single step in it that waits for
+ever takes the sidecar offline in the manager until someone restarts it,
+with nothing logged after "connecting to …". That is how three edges were
+stranded in bilbycast-edge#180, and the SDK had the same unbounded steps.
+Every step is now bounded, the same model the edge and the relay use. You
+inherit all of it; none of it is configuration (the values are constants in
+`src/ws_client.rs`):
+
+| Step | Bound | When it is hit |
+|---|---|---|
+| Dial: DNS, TCP, TLS and the HTTP upgrade | 30 s in all | The attempt fails; `run()` backs off and tries the next URL |
+| TCP across the manager's addresses | next address after 250 ms, or at once when one fails | The first to connect wins |
+| Writing the auth frame | 10 s | The attempt fails |
+| The auth reply | 10 s | The attempt fails |
+| Silence from the manager | 4 × its ping interval, never under 90 s; armed by the first ping | The session is dropped and redialled |
+| Any one write | 300 s | The session is dropped and redialled |
+| The Close frame at shutdown | 2 s | `run()` returns anyway |
+
+**Why TCP tries addresses in parallel.** `TcpStream::connect` on a host
+name tries the resolved addresses strictly one after another, so a first
+address that silently drops SYNs (a broken IPv6 path to a dual-stack
+manager is the usual one) holds it for the kernel's SYN timeout, about
+127 s. Inside a 30 s deadline the next address would never be tried. The
+SDK interleaves the address families, starts the next attempt 250 ms after
+the last if nothing has connected, and keeps whichever connects first —
+Happy Eyeballs, RFC 8305.
+
+**How the silence limit is learned.** The manager WS-pings every node on
+its `ws_keepalive_interval_secs` setting (1–300 s, default 15 s). The SDK
+keeps the last eight gaps between pings, each counted as at most 300 s,
+and uses their median: one stall on the manager does not stretch the limit
+for the rest of the session the way a running maximum would. Until the
+first ping the watchdog is unarmed, so a manager too old to ping is never
+dropped for being quiet; the 300 s write bound covers that case. Frames are
+read by a reader running beside the writes, so a gateway busy pushing stats
+or thumbnails up a slow link never takes a live manager for a dead one.
+
+**What the log shows.** A dial that took 5 s or more is warned about
+(`slow handshake`), as is a connection that had to fall back past an
+address that gave no answer (`that path to the manager may be broken`). A
+dropped session is logged as `session with <url> lost: …` with its cause —
+the manager silent past its limit, a write that could not complete, or a
+socket error. As before, a lost session does not reset the reconnect
+backoff; a session the manager closes cleanly does.
+
 ## 6. Testing with a mock manager
 
 `bilbycast-gateway-sdk/tests/integration_mock_manager.rs` shows how to
 spin up a plaintext WS server locally, connect the SDK to it, and assert
 on both directions of the wire. Copy it as the starting point for your
 gateway's integration tests.
+
+Its liveness tests (a manager that goes silent, one that stops reading, a
+command that outlasts the silence limit) exercise deadlines of minutes, so
+they switch to tokio's paused clock (`tokio::time::pause()`, the
+`test-util` feature) once the first session is up. Two things keep that
+honest against real loopback sockets, and you will need both if you copy
+the pattern: make the first connection on the real clock, and turn Nagle
+off on the mock's sockets. Otherwise a frame waiting on a real-time kernel
+timer looks, on the paused clock, like minutes of silence.
 
 For tests you'll need **both** halves of the plaintext opt-in — the SDK
 refuses plain `ws://` URLs otherwise:

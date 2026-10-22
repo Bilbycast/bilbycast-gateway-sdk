@@ -4,6 +4,41 @@ All notable changes to `bilbycast-gateway-sdk` are recorded here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A stalled manager could strand a gateway offline until it was
+  restarted.** The reconnect loop is one task, and every step of a
+  connection had an await that could wait for ever: the dial was raced only
+  against shutdown, the auth frame write had no deadline, nothing noticed a
+  session gone quiet, and no write in the session had a bound. A peer that
+  completes TCP and never sends the 101, or a manager that stops reading
+  while its kernel keeps ACKing, left the sidecar offline in the manager
+  with nothing logged after "connecting to …" — the failure that stranded
+  three edges in bilbycast-edge#180. Every step is now bounded, on the model
+  the edge and the relay share: a 30 s dial deadline over DNS, TCP, TLS and
+  the upgrade, with Happy-Eyeballs across the manager's addresses (one that
+  silently drops SYNs no longer holds the dial past its deadline); 10 s to
+  write the auth frame; a silence watchdog, armed by the first ping, that
+  takes the manager for dead after four times the median of its last eight
+  ping gaps (each capped at 300 s), never under 90 s; 300 s on every write;
+  2 s for the Close at shutdown, which no longer waits on a stuck write. The
+  frames are read beside the writes, so a gateway whose own writes are slow
+  is not mistaken for one whose manager has gone. All constants: no
+  `GatewayConfig` field and no `SdkError` variant was added.
+- **A long command silenced the link and could deadlock it.** Commands ran
+  inline in the session loop, so a long one (an `upgrade_binary` staging a
+  tarball) left the manager's pings unread for its whole run; and if the
+  vendor's frames filled the outbound channel meanwhile, the command's
+  `command_ack` waited on a channel only that parked loop drains. Commands
+  now run on a worker task, still one at a time and in order, across
+  reconnects too. Past 64 waiting, a command is answered at once with
+  `error_code = "gateway_busy"` and not run. A command running when its
+  session ends completes and is acked on the next session; queued ones are
+  dropped. A handler that panics now costs that one command, acked
+  `handler_panicked`, where the panic used to unwind out of `run()`.
+
 ## [0.10.5] - 2026-10-09
 
 ### Fixed

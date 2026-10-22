@@ -25,6 +25,15 @@ their polling loop and their [`CommandHandler`](src/dispatch.rs).
   - Heartbeat every 15 s (configurable)
   - String-based dispatch with a catch-all — new manager message types
     don't break old gateways
+  - Every step of the link bounded, so a stalled manager cannot strand the
+    sidecar offline: a 30 s dial deadline (DNS, TCP, TLS and the upgrade,
+    with Happy-Eyeballs across the manager's addresses), 10 s each to send
+    the auth frame and to get the reply, a silence watchdog learned from the
+    manager's pings (never under 90 s), a 300 s bound on every write and 2 s
+    for the Close at shutdown
+  - Commands run on a worker task, one at a time, never inside the session
+    loop, so a long command does not stop the link answering the manager;
+    past 64 queued, a command is refused at once with `gateway_busy`
 - `Emitter` — async helpers for `emit_stats`, `emit_event`, `emit_health`,
   `emit_thumbnail`, `emit_config_response`, `emit_command_ack`. Clone freely.
 - `CommandHandler` trait — your async fn receives `(command_id, action)` and
@@ -110,6 +119,16 @@ as the starting point for your gateway's integration suite. The test exercises:
 - `ping` → `pong`
 - server-close → SDK reconnects automatically
 - unknown manager message types are ignored (forward-compat)
+- a peer that never answers the upgrade → the dial gives up and retries
+- a manager that pings, then goes silent → the session is dropped and redialled
+- a command that outlasts the silence limit → the session stays up and the ack
+  arrives
+- a manager that stops reading → dropped at the write bound, not before;
+  shutdown stays prompt
+- a full command queue → `gateway_busy`
+
+The liveness cases run on tokio's paused clock, so the minutes of stall they
+exercise take milliseconds.
 
 ## Running against a local manager
 
