@@ -127,7 +127,14 @@ as the starting point for your gateway's integration suite. The test exercises:
   arrives
 - a manager that stops reading → dropped at the write bound, not before;
   shutdown stays prompt
-- a full command queue → `gateway_busy`
+- a full command queue, in count or in bytes → `gateway_busy`
+- a Ping and a Close read together → a clean close, which resets the backoff
+- a command running across a reconnect → it finishes first, and its ack rides
+  the next session; reconnects behind a hung command pile up no workers
+- shutdown while a command runs → `run()` waits for it, up to 30 s, and starts
+  nothing queued behind it
+- a command read together with the Close → dropped unrun
+- a handler that panics → `handler_panicked`, and the next command runs
 
 The liveness cases run on tokio's paused clock, so the minutes of stall they
 exercise take milliseconds.
