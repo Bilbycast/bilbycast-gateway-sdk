@@ -840,7 +840,8 @@ async fn a_manager_that_goes_silent_is_dropped_and_redialled() {
 #[tokio::test]
 async fn a_long_command_neither_silences_nor_wedges_the_session() {
     let slow = command("slow-1", json!({ "type": "slow", "secs": 150 }));
-    let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands: vec![slow] }]).await;
+    let (url, log) =
+        spawn_link_mock(vec![Behaviour::CommandsThenPing { commands: vec![slow] }]).await;
     let handler = Arc::new(SlowHandler::default());
     let (run_task, emitter, shutdown) = start_link_client(url, handler.clone()).await;
     first_session_then_pause_the_clock(&log).await;

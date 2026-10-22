@@ -523,7 +523,11 @@ impl GatewayClient {
     /// the loop run in this task, raced against each other and against
     /// shutdown, so a write the manager is not draining holds up neither the
     /// reading nor a shutdown.
-    async fn run_session(&mut self, mut write: ManagerSink, read: ManagerSource) -> ConnectionResult {
+    async fn run_session(
+        &mut self,
+        mut write: ManagerSink,
+        read: ManagerSource,
+    ) -> ConnectionResult {
         let started = Instant::now();
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_SIZE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_SIZE);
@@ -567,7 +571,8 @@ impl GatewayClient {
 
         if let ConnectionResult::ShutdownRequested = end {
             info!("Gateway SDK: shutdown requested, closing WebSocket");
-            let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, write.send(Message::Close(None))).await;
+            let close = write.send(Message::Close(None));
+            let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, close).await;
         }
         end
     }
@@ -608,21 +613,21 @@ async fn dial_manager(
     let deadline = started + DIAL_TIMEOUT;
     let (host, port) = manager_host_port(url)?;
 
-    let addrs: Vec<SocketAddr> =
-        match tokio::time::timeout_at(deadline, tokio::net::lookup_host((host.as_str(), port))).await {
-            Ok(Ok(addrs)) => addrs.collect(),
-            Ok(Err(e)) => {
-                return Err(SdkError::WebSocket(format!(
-                    "manager DNS lookup for {host} failed: {e}"
-                )));
-            }
-            Err(_) => {
-                return Err(SdkError::WebSocket(format!(
-                    "manager DNS lookup for {host} timed out after {}s",
-                    DIAL_TIMEOUT.as_secs()
-                )));
-            }
-        };
+    let lookup = tokio::net::lookup_host((host.as_str(), port));
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout_at(deadline, lookup).await {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(e)) => {
+            return Err(SdkError::WebSocket(format!(
+                "manager DNS lookup for {host} failed: {e}"
+            )));
+        }
+        Err(_) => {
+            return Err(SdkError::WebSocket(format!(
+                "manager DNS lookup for {host} timed out after {}s",
+                DIAL_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let count = addrs.len();
 
     let tcp = match tokio::time::timeout_at(
@@ -1019,7 +1024,11 @@ async fn drive_session(
 }
 
 /// Write one frame, giving up after [`WRITE_STALL_LIMIT`].
-async fn send_bounded(write: &mut ManagerSink, message: Message, what: &str) -> Result<(), SdkError> {
+async fn send_bounded(
+    write: &mut ManagerSink,
+    message: Message,
+    what: &str,
+) -> Result<(), SdkError> {
     match tokio::time::timeout(WRITE_STALL_LIMIT, write.send(message)).await {
         Ok(sent) => sent.map_err(SdkError::from),
         Err(_) => Err(SdkError::WebSocket(format!(
@@ -1451,7 +1460,8 @@ mod tests {
     async fn every_address_failing_reports_the_last_failure() {
         let (a, b) = (addr("192.0.2.1:443"), addr("192.0.2.2:443"));
         let failed = connect_staggered(VecDeque::from([a, b]), |addr| async move {
-            Err::<(), _>(io::Error::new(io::ErrorKind::ConnectionRefused, format!("refused by {addr}")))
+            let refused = format!("refused by {addr}");
+            Err::<(), _>(io::Error::new(io::ErrorKind::ConnectionRefused, refused))
         })
         .await;
         match failed {
