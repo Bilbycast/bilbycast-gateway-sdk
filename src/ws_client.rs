@@ -52,6 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinError;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -1228,7 +1229,10 @@ struct QueuedCommand {
 /// whichever session is up by then. At shutdown, `run()` waits up to
 /// [`COMMAND_DRAIN_LIMIT`] for it instead, and its ack is not sent.
 ///
-/// Commands still queued when the session ends are not started. The manager
+/// Commands still queued when the session ends are not started, and the
+/// queue is let go of then, even if a command is still running: kept until
+/// the handler returned, it would sit beside the next session's queue, and
+/// behind a handler that never returns it would be kept for good. The manager
 /// hears nothing back for them on that session and treats them as failed;
 /// running them anyway would change the device behind the operator's back.
 /// That includes a command read in the same burst as the manager's Close or
@@ -1270,21 +1274,53 @@ async fn run_commands(
         // Its own task, so a handler that panics costs that one command
         // rather than the worker, and the manager still hears back about it.
         let id = command.id.clone();
-        match tokio::spawn(run_command(command, handler.clone(), emitter.clone())).await {
-            Ok(()) => {}
-            Err(e) if e.is_panic() => {
-                error!("Gateway SDK: the handler panicked on command {id:?}: {e}");
-                let panicked = CommandError::new(
-                    PANICKED_ERROR_CODE,
-                    "The gateway's handler panicked on this command; see the gateway's log.",
-                );
-                let _ = emitter.emit_command_ack(&id, Err(panicked)).await;
+        let mut task = tokio::spawn(run_command(command, handler.clone(), emitter.clone()));
+        let joined = tokio::select! {
+            biased;
+            joined = &mut task => joined,
+            // The session ended while the command runs. Nothing queued
+            // behind it will start, so let the queue go now rather than
+            // when, if ever, the handler returns: a hung handler would
+            // otherwise hold its session's queue for good, beside the next
+            // session's. The turn is still held while the command is seen
+            // out, so the next session's first command still waits for it.
+            _ = session_over.cancelled() => {
+                report_dropped(&queue);
+                drop(queue);
+                finish_command(task.await, &id, &emitter).await;
+                return;
             }
-            // Cancelled: the runtime is shutting down.
-            Err(_) => return,
+        };
+        if !finish_command(joined, &id, &emitter).await {
+            return;
         }
     }
 
+    report_dropped(&queue);
+}
+
+/// See a command's task out. A handler that panicked gets a
+/// `handler_panicked` ack, so the manager still hears back about the
+/// command. `false` if the task was cancelled: the runtime is shutting down.
+async fn finish_command(joined: Result<(), JoinError>, id: &str, emitter: &Emitter) -> bool {
+    match joined {
+        Ok(()) => true,
+        Err(e) if e.is_panic() => {
+            error!("Gateway SDK: the handler panicked on command {id:?}: {e}");
+            let panicked = CommandError::new(
+                PANICKED_ERROR_CODE,
+                "The gateway's handler panicked on this command; see the gateway's log.",
+            );
+            let _ = emitter.emit_command_ack(id, Err(panicked)).await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Log the commands an ended session leaves in its queue, none of which
+/// will start.
+fn report_dropped(queue: &mpsc::Receiver<QueuedCommand>) {
     let dropped = queue.len();
     if dropped > 0 {
         warn!(
@@ -1561,6 +1597,145 @@ mod tests {
             "200 s spent waiting on the loop were taken for 200 s of silence from the manager"
         );
         reader.abort();
+    }
+
+    // ── Command worker ──────────────────────────────────────────────────
+
+    /// A handler whose commands each wait for `release` once they have
+    /// started, then succeed, or panic if `panics` is set.
+    #[derive(Default)]
+    struct HeldHandler {
+        started: Mutex<Vec<String>>,
+        running: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        panics: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandHandler for HeldHandler {
+        async fn handle_command(
+            &self,
+            command_id: String,
+            _action: Value,
+        ) -> Result<Value, CommandError> {
+            self.started.lock().unwrap().push(command_id.clone());
+            self.running.notify_one();
+            self.release.notified().await;
+            if self.panics {
+                panic!("the handler panics on {command_id}, as the test asked");
+            }
+            Ok(Value::Null)
+        }
+    }
+
+    /// A command as the session loop queues it, holding its share of
+    /// `budget`.
+    fn queued(id: &str, budget: &Arc<Semaphore>) -> QueuedCommand {
+        let frame = envelope("command", json!({ "command_id": id, "action": {} }));
+        let cost = u32::try_from(frame.len()).unwrap();
+        let held = budget.clone().try_acquire_many_owned(cost).unwrap();
+        QueuedCommand { id: id.into(), frame: frame.into(), held }
+    }
+
+    /// A worker holding the turn, with `first` running and `second` queued
+    /// behind it.
+    struct Running {
+        worker: tokio::task::JoinHandle<()>,
+        turn: Arc<Semaphore>,
+        budget: Arc<Semaphore>,
+        queue: mpsc::Sender<QueuedCommand>,
+        session_over: CancellationToken,
+        /// Where the worker's acks go.
+        outbound: mpsc::Receiver<OutboundFrame>,
+    }
+
+    async fn a_command_running(handler: Arc<HeldHandler>) -> Running {
+        let turn = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(Semaphore::new(COMMAND_QUEUE_BYTES));
+        let (queue, queue_rx) = mpsc::channel(COMMAND_QUEUE_SIZE);
+        let (outbound_tx, outbound) = mpsc::channel(OUTBOUND_CHANNEL_SIZE);
+        let session_over = CancellationToken::new();
+        let worker = tokio::spawn(run_commands(
+            turn.clone(),
+            queue_rx,
+            session_over.clone(),
+            handler.clone(),
+            Emitter::new(outbound_tx),
+        ));
+        queue.try_send(queued("first", &budget)).unwrap();
+        queue.try_send(queued("second", &budget)).unwrap();
+        tokio::time::timeout(secs(1), handler.running.notified())
+            .await
+            .expect("the first command should start");
+        Running { worker, turn, budget, queue, session_over, outbound }
+    }
+
+    fn ack_of(frame: &OutboundFrame) -> Value {
+        let envelope: Value = serde_json::from_str(&frame.0).unwrap();
+        assert_eq!(envelope["type"], "command_ack");
+        envelope["payload"].clone()
+    }
+
+    /// The session ends while its command runs. The worker lets the queue go
+    /// at once, rather than when the handler returns, which for a hung one is
+    /// never; until then a second session's queue would sit beside it. It
+    /// keeps the turn until the command has finished, so the next session's
+    /// first command still waits for this one, and the command's ack still
+    /// goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_ends_mid_command_lets_its_queue_go() {
+        let handler = Arc::new(HeldHandler::default());
+        let mut running = a_command_running(handler.clone()).await;
+
+        running.session_over.cancel();
+        assert!(
+            tokio::time::timeout(secs(1), running.queue.closed()).await.is_ok(),
+            "the queue of a session that has ended is held while its command runs"
+        );
+        assert_eq!(
+            running.budget.available_permits(),
+            COMMAND_QUEUE_BYTES,
+            "the command queued behind the running one is still resident"
+        );
+        assert_eq!(
+            running.turn.available_permits(),
+            0,
+            "the turn went before the command finished"
+        );
+
+        handler.release.notify_one();
+        tokio::time::timeout(secs(1), running.worker)
+            .await
+            .expect("the worker should return once its command has")
+            .unwrap();
+        assert_eq!(running.turn.available_permits(), 1);
+        let ack = ack_of(&running.outbound.try_recv().expect("the running command is acked"));
+        assert_eq!(ack["command_id"], "first");
+        assert_eq!(ack["success"], true);
+        assert_eq!(*handler.started.lock().unwrap(), ["first"]);
+    }
+
+    /// A handler that panics once its session has ended, after the worker
+    /// has let the queue go: the manager still gets the `handler_panicked`
+    /// ack, on the next session.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_after_the_session_ended_is_still_acked() {
+        let handler = Arc::new(HeldHandler { panics: true, ..HeldHandler::default() });
+        let mut running = a_command_running(handler.clone()).await;
+
+        running.session_over.cancel();
+        tokio::time::timeout(secs(1), running.queue.closed())
+            .await
+            .expect("the worker should let the queue go");
+        handler.release.notify_one();
+        tokio::time::timeout(secs(1), running.worker)
+            .await
+            .expect("the worker should return once its command has")
+            .unwrap();
+        let ack = ack_of(&running.outbound.try_recv().expect("the panicked command is acked"));
+        assert_eq!(ack["command_id"], "first");
+        assert_eq!(ack["error_code"], PANICKED_ERROR_CODE);
+        assert_eq!(*handler.started.lock().unwrap(), ["first"]);
     }
 
     // ── Dial ────────────────────────────────────────────────────────────
