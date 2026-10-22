@@ -166,9 +166,9 @@ starts only once the previous session's worker has finished.
 - **A long command is fine.** An `upgrade_binary` that spends minutes
   fetching a tarball, or a slow vendor RPC, does not stop the link reading
   the manager's pings or sending your stats.
-- **Up to 64 commands wait behind the one running.** Past that, each new
-  command is answered at once with a failed `command_ack`
-  (`error_code = "gateway_busy"`) and is not run.
+- **Up to 64 commands, and 20 MiB of them, wait behind the one running.**
+  Past either, each new command is answered at once with a failed
+  `command_ack` (`error_code = "gateway_busy"`) and is not run.
 - **A command that has started always finishes.** If the session ends while
   it runs, it completes and its ack goes out on the next session. At
   shutdown, `run()` waits up to 30 s for it before returning, and its ack is

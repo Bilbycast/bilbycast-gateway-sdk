@@ -34,7 +34,8 @@ their polling loop and their [`CommandHandler`](src/dispatch.rs).
     to finish
   - Commands run on a worker task, one at a time, never inside the session
     loop, so a long command does not stop the link answering the manager;
-    past 64 queued, a command is refused at once with `gateway_busy`
+    past 64 queued, or 20 MiB of them, a command is refused at once with
+    `gateway_busy`
 - `Emitter` — async helpers for `emit_stats`, `emit_event`, `emit_health`,
   `emit_thumbnail`, `emit_config_response`, `emit_command_ack`. Clone freely.
 - `CommandHandler` trait — your async fn receives `(command_id, action)` and

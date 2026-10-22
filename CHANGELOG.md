@@ -33,12 +33,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   vendor's frames filled the outbound channel meanwhile, the command's
   `command_ack` waited on a channel only that parked loop drains. Commands
   now run on a worker task, still one at a time and in order, across
-  reconnects too. Past 64 waiting, a command is answered at once with
-  `error_code = "gateway_busy"` and not run. A command running when its
-  session ends completes and is acked on the next session; queued ones are
-  dropped. At shutdown, `run()` waits up to 30 s for a command that has
-  started, so stopping the sidecar does not cut it off part-way through a
-  change; its ack is not sent. A handler that panics now costs that one
+  reconnects too. Past 64 waiting, or 20 MiB of them, a command is answered
+  at once with `error_code = "gateway_busy"` and not run. A command running
+  when its session ends completes and is acked on the next session; queued
+  ones are dropped. At shutdown, `run()` waits up to 30 s for a command that
+  has started, so stopping the sidecar does not cut it off part-way through
+  a change; its ack is not sent. A handler that panics now costs that one
   command, acked `handler_panicked`, where the panic used to unwind out of
   `run()`.
 

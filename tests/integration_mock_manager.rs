@@ -22,7 +22,8 @@
 //!   answering pings, and the ack arrives
 //! - a manager that stops reading → dropped at the write bound, not before;
 //!   shutdown stays prompt
-//! - more commands than the queue holds → answered `gateway_busy`
+//! - more commands than the queue holds, in count or in bytes → answered
+//!   `gateway_busy`
 //! - a Ping and a Close read together → a clean close, which resets the
 //!   reconnect backoff
 //! - a command running when its session ends → it finishes, its ack rides
@@ -1292,4 +1293,41 @@ async fn no_queued_command_starts_while_the_close_is_written() {
         ["slow-1"],
         "a command queued behind it started after shutdown was requested"
     );
+}
+
+/// Commands too big for the queue's bytes, behind a long one. The queue was
+/// bounded only in count, so 64 commands of up to 5 MiB each, parsed and many
+/// times that in memory, could wait behind a slow command. Now a command
+/// past the queue's 20 MiB is refused with `gateway_busy` at once, like one
+/// past its 64, and every command is still answered.
+#[tokio::test]
+async fn commands_past_the_queue_byte_budget_are_answered_busy() {
+    let pad = "x".repeat(4 << 20);
+    let mut commands = vec![command("slow-1", json!({ "type": "slow", "secs": 600 }))];
+    commands.extend(
+        (0..10).map(|n| command(&format!("big-{n}"), json!({ "type": "echo", "pad": pad }))),
+    );
+    let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands }]).await;
+    let (run_task, _emitter, shutdown) =
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(1000), || log.acks().len() >= 11).await,
+        "every command must be answered, got {} acks",
+        log.acks().len()
+    );
+    let (slow_done, _) = log.ack("slow-1").unwrap();
+    let acks = log.acks();
+    let busy: Vec<_> = acks.iter().filter(|(_, a)| a["error_code"] == "gateway_busy").collect();
+    assert!(!busy.is_empty(), "the commands past the queue's bytes must be refused as busy");
+    assert!(
+        busy.iter().all(|(at, _)| *at < slow_done),
+        "a busy refusal must come at once, not after the running command"
+    );
+    let ran = acks.iter().filter(|(_, a)| a["success"] == true && a["command_id"] != "slow-1");
+    assert_eq!(ran.count() + busy.len(), 10, "one ack per command");
+    assert!(busy.len() < 10, "the queue must still take what fits in its bytes");
+
+    stop(run_task, shutdown).await;
 }

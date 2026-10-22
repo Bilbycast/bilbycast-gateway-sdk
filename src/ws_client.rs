@@ -40,7 +40,7 @@
 //!   command already running to finish.
 
 use futures_util::stream::{FuturesUnordered, SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -141,11 +141,23 @@ const COMMAND_DRAIN_LIMIT: Duration = Duration::from_secs(30);
 /// taken. Only a loop held up in a write lets this fill.
 const INBOUND_CHANNEL_SIZE: usize = 256;
 
-/// Commands that may wait behind the one running. Past this the session loop
-/// answers each new command with a `gateway_busy` error ack at once, so the
-/// manager hears "not run" rather than timing out on a command that might
-/// still run much later.
+/// Bytes of text frames the reader may have handed the session loop that the
+/// loop has not yet taken; past this the reader waits for the loop before it
+/// reads on. The channel bounds only how many: 256 frames of
+/// [`MAX_INBOUND_WS_BYTES`] would be 1.25 GiB.
+const INBOUND_BUDGET_BYTES: usize = 4 * MAX_INBOUND_WS_BYTES;
+
+/// Commands that may wait behind the one running, and at most
+/// [`COMMAND_QUEUE_BYTES`] of them. Past either the session loop answers each
+/// new command with a `gateway_busy` error ack at once, so the manager hears
+/// "not run" rather than timing out on a command that might still run much
+/// later.
 const COMMAND_QUEUE_SIZE: usize = 64;
+
+/// Bytes of commands, as they came off the wire, that may wait behind the one
+/// running. A command is queued as its frame and parsed only when it starts,
+/// because a parsed action can take many times its wire size.
+const COMMAND_QUEUE_BYTES: usize = 4 * MAX_INBOUND_WS_BYTES;
 
 /// `error_code` on the ack for a command refused because the queue is full.
 const BUSY_ERROR_CODE: &str = "gateway_busy";
@@ -161,6 +173,14 @@ const PANICKED_ERROR_CODE: &str = "handler_panicked";
 /// defense-in-depth: if the manager's cap is ever bypassed or
 /// misconfigured, bounding the SDK side prevents a hostile or buggy peer
 /// from forcing a multi-gigabyte allocation in the sidecar.
+///
+/// More than one message can be held at a time, because the reader keeps
+/// reading while the session loop is held up in a write and commands wait
+/// behind the one running, so those queues are bounded in bytes as well as
+/// in count. At most [`INBOUND_BUDGET_BYTES`] of frames wait for the loop and
+/// [`COMMAND_QUEUE_BYTES`] of commands for the worker, besides one frame in
+/// the reader's hands and one in tungstenite's buffer, and the frame being
+/// routed and the command running, each of those two parsed.
 ///
 /// `tokio-tungstenite`'s default is 64 MiB / 16 MiB (message / frame),
 /// which is well above anything legitimate WS traffic produces here.
@@ -558,6 +578,7 @@ impl GatewayClient {
     ) -> ConnectionResult {
         let started = Instant::now();
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_SIZE);
+        let inbound_budget = Arc::new(Semaphore::new(INBOUND_BUDGET_BYTES));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_SIZE);
 
         // Cancelled as soon as the session ends, so the worker never starts a
@@ -579,7 +600,7 @@ impl GatewayClient {
 
             _ = shutdown.cancelled() => ConnectionResult::ShutdownRequested,
 
-            (silent, limit) = read_manager(read, inbound_tx, started) => {
+            (silent, limit) = read_manager(read, inbound_tx, inbound_budget, started) => {
                 ConnectionResult::AuthenticatedThenLost(SdkError::WebSocket(format!(
                     "nothing from the manager for {}s, past the {}s its pings allow — \
                      taking the session for dead",
@@ -905,11 +926,13 @@ impl InboundCadence {
 
 /// What the reader hands the session loop, in the order it read it.
 enum Inbound {
-    Text(Utf8Bytes),
+    /// A text frame, with its share of [`INBOUND_BUDGET_BYTES`], given back
+    /// once the loop has routed it.
+    Text(Utf8Bytes, OwnedSemaphorePermit),
     /// A WS Ping to answer with a Pong.
     Ping(Bytes),
     Closed(Option<CloseFrame>),
-    Failed(tokio_tungstenite::tungstenite::Error),
+    Failed(WsError),
     Ended,
 }
 
@@ -925,15 +948,21 @@ enum Inbound {
 ///
 /// Text, a Close, an error or the end of the stream go to the session loop in
 /// the order they were read, so the commands a manager sent before closing
-/// are still handled; a Ping goes over as a request for a Pong. Returns only
-/// when the manager has been silent past its limit, as `(silent, limit)`.
-/// Every other end of the session is the loop's to report, so once it has
-/// been handed one, this parks.
-async fn read_manager(
-    mut read: ManagerSource,
+/// are still handled; a Ping goes over as a request for a Pong. A text frame
+/// waits for its share of `budget` first, so a loop held up in a write holds
+/// up the reading once that many bytes are waiting for it, rather than once
+/// the channel's count is. Returns only when the manager has been silent past
+/// its limit, as `(silent, limit)`. Every other end of the session is the
+/// loop's to report, so once it has been handed one, this parks.
+async fn read_manager<S>(
+    mut read: S,
     inbound: mpsc::Sender<Inbound>,
+    budget: Arc<Semaphore>,
     started: Instant,
-) -> (Duration, Duration) {
+) -> (Duration, Duration)
+where
+    S: Stream<Item = Result<Message, WsError>> + Unpin,
+{
     let mut cadence = InboundCadence::new(started);
     let mut check = tokio::time::interval(SILENCE_CHECK);
     check.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -957,7 +986,14 @@ async fn read_manager(
                     }
                     Some(Ok(Message::Text(text))) => {
                         cadence.on_frame(now);
-                        Inbound::Text(text)
+                        // A frame is at most `MAX_INBOUND_WS_BYTES`, a quarter
+                        // of the budget, so this comes back once the loop has
+                        // routed what is ahead of it.
+                        let cost = u32::try_from(text.len()).unwrap_or(u32::MAX);
+                        let Ok(held) = budget.clone().acquire_many_owned(cost).await else {
+                            return std::future::pending().await;
+                        };
+                        Inbound::Text(text, held)
                     }
                     Some(Ok(Message::Close(frame))) => {
                         cadence.on_frame(now);
@@ -975,10 +1011,16 @@ async fn read_manager(
                     Some(Err(e)) => Inbound::Failed(e),
                     None => Inbound::Ended,
                 };
-                let more = matches!(handover, Inbound::Text(_));
+                let more = matches!(handover, Inbound::Text(..));
                 if inbound.send(handover).await.is_err() || !more {
                     return std::future::pending().await;
                 }
+                // Waiting for the loop, for budget or for room in the channel,
+                // is this side's backpressure, not the manager going quiet,
+                // and nothing was read meanwhile. Time the silence from here:
+                // with the next frame only half arrived, the check would
+                // otherwise judge it from a stamp taken before the wait.
+                cadence.on_frame(Instant::now());
             }
 
             _ = check.tick() => {
@@ -1009,6 +1051,7 @@ async fn drive_session(
 ) -> ConnectionResult {
     let mut heartbeat = tokio::time::interval(heartbeat_interval);
     heartbeat.tick().await; // skip the immediate tick
+    let command_budget = Arc::new(Semaphore::new(COMMAND_QUEUE_BYTES));
 
     loop {
         let sent = tokio::select! {
@@ -1016,7 +1059,9 @@ async fn drive_session(
 
             // Inbound from manager
             frame = inbound.recv() => match frame {
-                Some(Inbound::Text(text)) => route_inbound(&text, &commands, write).await,
+                Some(Inbound::Text(text, _held)) => {
+                    route_inbound(&text, &commands, &command_budget, write).await
+                }
                 Some(Inbound::Ping(data)) => {
                     // tungstenite answers pings itself, but being explicit is
                     // safer.
@@ -1093,36 +1138,37 @@ async fn send_bounded(
 async fn route_inbound(
     text: &str,
     commands: &mpsc::Sender<QueuedCommand>,
+    command_budget: &Arc<Semaphore>,
     write: &mut ManagerSink,
 ) -> Result<(), SdkError> {
-    let Some(incoming) = IncomingMessage::parse(text) else {
+    let Some(IncomingMessage { msg_type, payload }) = IncomingMessage::parse(text) else {
         debug!("Gateway SDK: malformed JSON envelope, dropping");
         return Ok(());
     };
 
-    match incoming.msg_type.as_str() {
-        "command" => match commands.try_send(QueuedCommand::from_payload(&incoming.payload)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(command)) => {
-                warn!(
-                    "Gateway SDK: {COMMAND_QUEUE_SIZE} commands already waiting, \
-                     refusing command {:?} as busy",
-                    command.id
-                );
-                let busy = CommandError::new(
-                    BUSY_ERROR_CODE,
-                    "The gateway is still working through earlier commands and did not run \
-                     this one. Retry once they have finished.",
-                );
-                let ack = envelope("command_ack", command_ack_payload(&command.id, Err(busy)));
-                send_bounded(write, Message::Text(ack.into()), "command_ack").await
+    match msg_type.as_str() {
+        "command" => {
+            let id = payload
+                .get("command_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // The command queues as its frame; the parse is not kept.
+            drop(payload);
+            let cost = u32::try_from(text.len()).unwrap_or(u32::MAX);
+            let Ok(held) = command_budget.clone().try_acquire_many_owned(cost) else {
+                return refuse_busy(write, &id).await;
+            };
+            match commands.try_send(QueuedCommand { id, frame: text.into(), held }) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(command)) => refuse_busy(write, &command.id).await,
+                // The worker outlives the session, so this means it is gone
+                // for good; a new session starts a new one.
+                Err(TrySendError::Closed(_)) => {
+                    Err(SdkError::Channel("the command worker has stopped".into()))
+                }
             }
-            // The worker outlives the session, so this means it is gone for
-            // good; a new session starts a new one.
-            Err(TrySendError::Closed(_)) => {
-                Err(SdkError::Channel("the command worker has stopped".into()))
-            }
-        },
+        }
         "ping" => {
             let pong = envelope("pong", Value::Null);
             send_bounded(write, Message::Text(pong.into()), "pong").await
@@ -1139,23 +1185,32 @@ async fn route_inbound(
     }
 }
 
+/// Answer a command there is no room to queue with a `gateway_busy` error
+/// ack, written here rather than sent through the outbound channel, which
+/// only the session loop drains.
+async fn refuse_busy(write: &mut ManagerSink, id: &str) -> Result<(), SdkError> {
+    warn!(
+        "Gateway SDK: the command queue is full ({COMMAND_QUEUE_SIZE} commands or {} MiB), \
+         refusing command {id:?} as busy",
+        COMMAND_QUEUE_BYTES >> 20
+    );
+    let busy = CommandError::new(
+        BUSY_ERROR_CODE,
+        "The gateway is still working through earlier commands and did not run \
+         this one. Retry once they have finished.",
+    );
+    let ack = envelope("command_ack", command_ack_payload(id, Err(busy)));
+    send_bounded(write, Message::Text(ack.into()), "command_ack").await
+}
+
 /// A command from the manager, waiting for the worker.
 struct QueuedCommand {
     id: String,
-    action: Value,
-}
-
-impl QueuedCommand {
-    fn from_payload(payload: &Value) -> Self {
-        Self {
-            id: payload
-                .get("command_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            action: payload.get("action").cloned().unwrap_or(Value::Null),
-        }
-    }
+    /// The envelope as it came off the wire, parsed again when the command
+    /// starts.
+    frame: Box<str>,
+    /// Its share of [`COMMAND_QUEUE_BYTES`], given back when it starts.
+    held: OwnedSemaphorePermit,
 }
 
 /// Run a session's commands, one at a time, off the session loop.
@@ -1231,7 +1286,17 @@ async fn run_commands(
 
 /// Run one command through the vendor's handler and queue its ack.
 async fn run_command(command: QueuedCommand, handler: Arc<dyn CommandHandler>, emitter: Emitter) {
-    let QueuedCommand { id, action } = command;
+    // Started, so no longer waiting: its bytes leave the queue's budget, and
+    // only its action is kept, parsed, while it runs.
+    let QueuedCommand { id, frame, held } = command;
+    drop(held);
+    // `route_inbound` parsed this frame once already, so it parses again; a
+    // payload that is not an object carries no action.
+    let action = match IncomingMessage::parse(&frame).map(|message| message.payload) {
+        Some(Value::Object(mut payload)) => payload.remove("action").unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    drop(frame);
 
     // Special-case `get_config`: invoke the config hook and emit
     // a `config_response` envelope. Ack with success.
@@ -1418,6 +1483,74 @@ mod tests {
         c.on_frame(t0 + secs(80));
         assert_eq!(c.dead_for(t0 + secs(80) + secs(90)), None);
         assert!(c.dead_for(t0 + secs(80) + secs(91)).is_some());
+    }
+
+    // ── Reader ──────────────────────────────────────────────────────────
+
+    fn text(len: usize) -> Result<Message, WsError> {
+        Ok(Message::Text("x".repeat(len).into()))
+    }
+
+    /// A session loop slow to take frames. The reader hands frames over
+    /// until their bytes reach its budget, then waits for the loop, rather
+    /// than reading on until the channel's count is used up.
+    #[tokio::test(start_paused = true)]
+    async fn the_reader_waits_once_its_byte_budget_is_handed_over() {
+        let frames = futures_util::stream::iter([text(1000), text(1000)])
+            .chain(futures_util::stream::pending());
+        let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_CHANNEL_SIZE);
+        let budget = Arc::new(Semaphore::new(1500));
+        let reader = tokio::spawn(read_manager(frames, inbound_tx, budget, Instant::now()));
+
+        let Some(Inbound::Text(_, first)) = inbound.recv().await else {
+            panic!("the first frame should be handed over");
+        };
+        tokio::time::sleep(secs(60)).await;
+        assert!(inbound.try_recv().is_err(), "a frame went over past the reader's budget");
+
+        drop(first);
+        let Some(Inbound::Text(..)) = inbound.recv().await else {
+            panic!("the next frame should follow once the loop has taken the first");
+        };
+        reader.abort();
+    }
+
+    /// While the reader waits for the loop it reads nothing, so it cannot
+    /// tell a quiet manager from a busy loop, and the wait must not count as
+    /// silence. Here the next frame has not arrived when the wait ends, so
+    /// the silence check runs at once.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_the_loop_is_not_silence() {
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
+        let frames = futures_util::stream::poll_fn(move |cx| frames_rx.poll_recv(cx));
+        let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_CHANNEL_SIZE);
+        let budget = Arc::new(Semaphore::new(1000));
+        let reader = tokio::spawn(read_manager(frames, inbound_tx, budget, Instant::now()));
+
+        // The ping arms the watchdog, at its 90 s floor.
+        for frame in [Ok(Message::Ping(Bytes::new())), text(1000), text(1000)] {
+            frames_tx.send(frame).unwrap();
+        }
+        let Some(Inbound::Ping(_)) = inbound.recv().await else {
+            panic!("the ping should be handed over");
+        };
+        let Some(Inbound::Text(_, first)) = inbound.recv().await else {
+            panic!("the first frame should be handed over");
+        };
+
+        // The loop takes 200 s to get to the first frame, and the reader
+        // holds the second meanwhile.
+        tokio::time::sleep(secs(200)).await;
+        drop(first);
+        let Some(Inbound::Text(..)) = inbound.recv().await else {
+            panic!("the second frame should follow");
+        };
+        tokio::time::sleep(secs(10)).await;
+        assert!(
+            !reader.is_finished(),
+            "200 s spent waiting on the loop were taken for 200 s of silence from the manager"
+        );
+        reader.abort();
     }
 
     // ── Dial ────────────────────────────────────────────────────────────
