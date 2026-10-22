@@ -178,7 +178,9 @@ starts only once the previous session's worker has finished.
   ack with `error_code = "handler_panicked"`, and the next command runs.
 - **A handler that never returns stops every command after it.** The link
   stays up, but the queue fills and the manager starts getting
-  `gateway_busy`. Put a timeout on every vendor call.
+  `gateway_busy`, and the commands of any session that ends meanwhile are
+  dropped with it rather than kept waiting. Put a timeout on every vendor
+  call.
 
 ## 4. The polling engine
 

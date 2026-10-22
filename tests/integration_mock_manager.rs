@@ -25,6 +25,10 @@
 //! - more commands than the queue holds → answered `gateway_busy`
 //! - a Ping and a Close read together → a clean close, which resets the
 //!   reconnect backoff
+//! - a command running when its session ends → it finishes, its ack rides
+//!   the next session, and that session's commands wait for it
+//! - reconnects behind a command that never returns → no pile-up of workers,
+//!   and the commands of the sessions that ended never run
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -543,6 +547,9 @@ enum Behaviour {
     /// Send these frames in a single write, so the gateway reads them
     /// together, then read until the gateway hangs up.
     Burst { frames: Vec<Message> },
+    /// Send these envelopes, close the session `after` that, and read until
+    /// the gateway hangs up.
+    CommandsThenClose { commands: Vec<Value>, after: Duration },
 }
 
 /// When things happened on a liveness mock, across all its connections.
@@ -659,6 +666,16 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
             }
             Behaviour::PingButNeverRead => (usize::MAX, PING_EVERY),
             Behaviour::Quiet => (0, PING_EVERY),
+            Behaviour::CommandsThenClose { commands, after } => {
+                for command in commands {
+                    if write.send(Message::Text(command.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(after).await;
+                let _ = write.send(Message::Close(None)).await;
+                (0, PING_EVERY)
+            }
             Behaviour::Burst { frames } => {
                 for frame in frames {
                     if write.feed(frame).await.is_err() {
@@ -686,26 +703,50 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
     }
 }
 
-/// A handler whose `slow` command sleeps for `action.secs`, recording when it
-/// ran; everything else succeeds at once.
+/// The liveness tests' handler, which records when each command starts and
+/// finishes. A `slow` command sleeps for `action.secs` and a `hang` command
+/// waits for `release`; everything else succeeds at once.
 #[derive(Default)]
-struct SlowHandler {
-    ran: Mutex<Option<(Instant, Instant)>>,
+struct LinkHandler {
+    started: Mutex<Vec<(String, Instant)>>,
+    finished: Mutex<Vec<(String, Instant)>>,
+    release: tokio::sync::Notify,
+}
+
+impl LinkHandler {
+    /// The commands started so far, in order.
+    fn started(&self) -> Vec<String> {
+        self.started.lock().unwrap().iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    fn started_at(&self, command_id: &str) -> Option<Instant> {
+        let started = self.started.lock().unwrap();
+        started.iter().find(|(id, _)| id == command_id).map(|(_, at)| *at)
+    }
+
+    fn finished_at(&self, command_id: &str) -> Option<Instant> {
+        let finished = self.finished.lock().unwrap();
+        finished.iter().find(|(id, _)| id == command_id).map(|(_, at)| *at)
+    }
 }
 
 #[async_trait]
-impl CommandHandler for SlowHandler {
+impl CommandHandler for LinkHandler {
     async fn handle_command(
         &self,
-        _command_id: String,
+        command_id: String,
         action: Value,
     ) -> Result<Value, CommandError> {
-        if action["type"] == "slow" {
-            let started = Instant::now();
-            let secs = action["secs"].as_u64().unwrap_or(0);
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-            *self.ran.lock().unwrap() = Some((started, Instant::now()));
+        self.started.lock().unwrap().push((command_id.clone(), Instant::now()));
+        match action["type"].as_str() {
+            Some("slow") => {
+                let secs = action["secs"].as_u64().unwrap_or(0);
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+            Some("hang") => self.release.notified().await,
+            _ => {}
         }
+        self.finished.lock().unwrap().push((command_id, Instant::now()));
         Ok(Value::Null)
     }
 }
@@ -724,7 +765,7 @@ type RunTask = tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkErro
 /// after 1 s whatever the attempt.
 async fn start_link_client(
     url: String,
-    handler: Arc<SlowHandler>,
+    handler: Arc<LinkHandler>,
 ) -> (RunTask, bilbycast_gateway_sdk::Emitter, bilbycast_gateway_sdk::CancellationToken) {
     start_link_client_backing_off(url, handler, vec![1]).await
 }
@@ -732,7 +773,7 @@ async fn start_link_client(
 /// [`start_link_client`] with these reconnect backoff steps.
 async fn start_link_client_backing_off(
     url: String,
-    handler: Arc<SlowHandler>,
+    handler: Arc<LinkHandler>,
     steps_secs: Vec<u64>,
 ) -> (RunTask, bilbycast_gateway_sdk::Emitter, bilbycast_gateway_sdk::CancellationToken) {
     enable_plaintext_ws();
@@ -799,7 +840,7 @@ async fn a_dial_to_a_peer_that_never_answers_is_abandoned_and_retried() {
     });
 
     let (run_task, _emitter, shutdown) =
-        start_link_client(url, Arc::new(SlowHandler::default())).await;
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
 
     tokio::time::timeout(Duration::from_secs(10), accepted.recv())
         .await
@@ -824,7 +865,7 @@ async fn a_dial_to_a_peer_that_never_answers_is_abandoned_and_retried() {
 async fn a_manager_that_goes_silent_is_dropped_and_redialled() {
     let (url, log) = spawn_link_mock(vec![Behaviour::PingThenSilent { count: 2 }]).await;
     let (run_task, _emitter, shutdown) =
-        start_link_client(url, Arc::new(SlowHandler::default())).await;
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
     first_session_then_pause_the_clock(&log).await;
 
     assert!(
@@ -861,7 +902,7 @@ async fn a_long_command_neither_silences_nor_wedges_the_session() {
     let slow = command("slow-1", json!({ "type": "slow", "secs": 150 }));
     let (url, log) =
         spawn_link_mock(vec![Behaviour::CommandsThenPing { commands: vec![slow] }]).await;
-    let handler = Arc::new(SlowHandler::default());
+    let handler = Arc::new(LinkHandler::default());
     let (run_task, emitter, shutdown) = start_link_client(url, handler.clone()).await;
     first_session_then_pause_the_clock(&log).await;
 
@@ -876,7 +917,8 @@ async fn a_long_command_neither_silences_nor_wedges_the_session() {
         wait_until(Duration::from_secs(400), || log.ack("slow-1").is_some()).await,
         "the long command's ack must arrive"
     );
-    let (started, finished) = handler.ran.lock().unwrap().expect("the command ran");
+    let started = handler.started_at("slow-1").expect("the command ran");
+    let finished = handler.finished_at("slow-1").expect("the command finished");
     let answered = log.pongs_between(started, finished);
     assert!(
         answered >= 20,
@@ -917,7 +959,7 @@ fn flood(emitter: bilbycast_gateway_sdk::Emitter) -> tokio::task::JoinHandle<()>
 async fn a_manager_that_stops_reading_is_dropped_at_the_write_bound_not_before() {
     let (url, log) = spawn_link_mock(vec![Behaviour::PingButNeverRead]).await;
     let (run_task, emitter, shutdown) =
-        start_link_client(url, Arc::new(SlowHandler::default())).await;
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
     let vendor = flood(emitter);
     first_session_then_pause_the_clock(&log).await;
     let session_up = log.auths()[0];
@@ -945,7 +987,7 @@ async fn a_manager_that_stops_reading_is_dropped_at_the_write_bound_not_before()
 async fn shutdown_is_prompt_while_the_manager_is_not_reading() {
     let (url, log) = spawn_link_mock(vec![Behaviour::PingButNeverRead]).await;
     let (run_task, emitter, shutdown) =
-        start_link_client(url, Arc::new(SlowHandler::default())).await;
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
     let vendor = flood(emitter);
     first_session_then_pause_the_clock(&log).await;
     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -969,7 +1011,7 @@ async fn a_full_command_queue_is_answered_busy() {
     commands.extend((0..100).map(|n| command(&format!("echo-{n}"), json!({ "type": "echo" }))));
     let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands }]).await;
     let (run_task, _emitter, shutdown) =
-        start_link_client(url, Arc::new(SlowHandler::default())).await;
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
     first_session_then_pause_the_clock(&log).await;
 
     assert!(
@@ -1015,12 +1057,105 @@ async fn a_close_read_behind_a_ping_is_a_clean_close() {
     };
     let (url, log) = spawn_link_mock(vec![ping_then_close.clone(), ping_then_close]).await;
     let (run_task, _emitter, shutdown) =
-        start_link_client_backing_off(url, Arc::new(SlowHandler::default()), vec![1, 60]).await;
+        start_link_client_backing_off(url, Arc::new(LinkHandler::default()), vec![1, 60]).await;
     first_session_then_pause_the_clock(&log).await;
 
     assert!(
         wait_until(Duration::from_secs(30), || log.auths().len() >= 3).await,
         "a session the manager closed must reset the backoff, not count as lost"
+    );
+
+    stop(run_task, shutdown).await;
+}
+
+/// A command still running when its session ends. It finishes, and its ack
+/// goes out on the next session; that session's command waits for it rather
+/// than running beside it, as a vendor handler written for one command at a
+/// time expects.
+#[tokio::test]
+async fn commands_never_overlap_across_a_reconnect() {
+    let first = Behaviour::CommandsThenClose {
+        commands: vec![command("slow-1", json!({ "type": "slow", "secs": 20 }))],
+        after: Duration::from_secs(1),
+    };
+    let second = Behaviour::CommandsThenPing {
+        commands: vec![command("echo-2", json!({ "type": "echo" }))],
+    };
+    let (url, log) = spawn_link_mock(vec![first, second]).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, _emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            log.ack("slow-1").is_some() && log.ack("echo-2").is_some()
+        })
+        .await,
+        "both commands must be answered"
+    );
+    let reconnected = log.auths()[1];
+    let (acked, ack) = log.ack("slow-1").unwrap();
+    assert_eq!(ack["success"], true);
+    assert!(acked > reconnected, "the ack must go out on the next session");
+    let slow_done = handler.finished_at("slow-1").unwrap();
+    let echo_started = handler.started_at("echo-2").unwrap();
+    assert!(
+        echo_started >= slow_done,
+        "the next session's command started {:?} before the running one finished",
+        slow_done - echo_started
+    );
+
+    stop(run_task, shutdown).await;
+}
+
+/// A handler that never returns while the link keeps reconnecting. Each
+/// session's worker used to wait on the previous session's worker for as
+/// long as the hang lasted, holding its session's queue, so every reconnect
+/// parked one more. A worker whose session ends before its turn now returns,
+/// so the number of live workers (each holds a handle to the handler) stays
+/// put however often the link flaps. The commands of the sessions that ended
+/// never run, before or after the hang ends.
+#[tokio::test]
+async fn reconnects_behind_a_hung_command_do_not_pile_up_workers() {
+    const FLAPS: usize = 10;
+    let mut behaviours = vec![Behaviour::CommandsThenClose {
+        commands: vec![command("hang-1", json!({ "type": "hang" }))],
+        after: Duration::from_secs(1),
+    }];
+    behaviours.extend((2..=FLAPS).map(|n| Behaviour::CommandsThenClose {
+        commands: vec![command(&format!("echo-{n}"), json!({ "type": "echo" }))],
+        after: Duration::from_secs(1),
+    }));
+    // The session after the last flap is the mock's default, Quiet, and
+    // stays up.
+    let (url, log) = spawn_link_mock(behaviours).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, _emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(120), || log.auths().len() > FLAPS).await,
+        "the link must keep reconnecting behind the hung command"
+    );
+    // This test's, the client's, the hung command's worker and its task, and
+    // the live session's worker waiting for the turn.
+    assert!(
+        wait_until(Duration::from_secs(5), || Arc::strong_count(&handler) <= 5).await,
+        "{} handles to the handler after {FLAPS} reconnects: the workers of ended sessions are \
+         still parked",
+        Arc::strong_count(&handler)
+    );
+
+    handler.release.notify_one();
+    assert!(
+        wait_until(Duration::from_secs(10), || log.ack("hang-1").is_some()).await,
+        "the hung command's ack must arrive once it returns"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        handler.started(),
+        ["hang-1"],
+        "a command queued in a session that ended must never run"
     );
 
     stop(run_task, shutdown).await;

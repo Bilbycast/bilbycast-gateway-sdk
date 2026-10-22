@@ -49,9 +49,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
@@ -261,9 +260,11 @@ pub struct GatewayClient {
     on_register: Option<RegisterCallback>,
     /// Lock-free manager-link state, cloneable to any task for local surfacing.
     connection_state: ConnectionState,
-    /// The latest session's command worker. The next session's worker waits
-    /// for it, so commands never overlap across a reconnect either.
-    command_worker: Option<JoinHandle<()>>,
+    /// The turn to run commands, held by one session's command worker at a
+    /// time. It is handed out in the order the workers asked for it, so a
+    /// session's worker starts only once the previous one has finished, and
+    /// commands never overlap across a reconnect either.
+    command_turn: Arc<Semaphore>,
 }
 
 impl GatewayClient {
@@ -290,7 +291,7 @@ impl GatewayClient {
             credentials,
             on_register: None,
             connection_state: ConnectionState::new(),
-            command_worker: None,
+            command_turn: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -537,13 +538,13 @@ impl GatewayClient {
         // a command for a session that has already ended.
         let session_over = CancellationToken::new();
         let _session_over = session_over.clone().drop_guard();
-        self.command_worker = Some(tokio::spawn(run_commands(
-            self.command_worker.take(),
+        tokio::spawn(run_commands(
+            self.command_turn.clone(),
             command_rx,
             session_over,
             self.handler.clone(),
             Emitter::new(self.outbound_tx.clone()),
-        )));
+        ));
 
         let shutdown = self.shutdown.clone();
         let end = tokio::select! {
@@ -1128,25 +1129,35 @@ impl QueuedCommand {
 /// Run a session's commands, one at a time, off the session loop.
 ///
 /// Vendor handlers are written for one command at a time, and get that across
-/// sessions too: a worker starts only once the previous session's worker has
-/// finished, so a command still running when its session ended (an
-/// `upgrade_binary` fetching a tarball, say) completes before the next
-/// session's first command starts. A command that has started always runs to
-/// completion and its ack goes out on whichever session is up by then.
+/// sessions too: a worker starts only once it holds the command turn, which
+/// the previous session's worker gives up when it has finished. So a command
+/// still running when its session ended (an `upgrade_binary` fetching a
+/// tarball, say) completes before the next session's first command starts. A
+/// command that has started always runs to completion and its ack goes out on
+/// whichever session is up by then.
 ///
 /// Commands still queued when the session ends are not started. The manager
 /// hears nothing back for them on that session and treats them as failed;
 /// running them anyway would change the device behind the operator's back.
 async fn run_commands(
-    previous: Option<JoinHandle<()>>,
+    turn: Arc<Semaphore>,
     mut queue: mpsc::Receiver<QueuedCommand>,
     session_over: CancellationToken,
     handler: Arc<dyn CommandHandler>,
     emitter: Emitter,
 ) {
-    if let Some(previous) = previous {
-        let _ = previous.await;
-    }
+    // Wait for the turn, but no longer than the session lasts. A worker whose
+    // session ends first has started nothing, so it has nothing to keep in
+    // order: it gives up its place in the line and returns, and its queue
+    // goes with it. Waiting on regardless, every reconnect behind a handler
+    // that never returns would park one more worker holding one more queue.
+    // Without the turn the session is over (the semaphore is never closed),
+    // and the loop below breaks before it takes a command.
+    let _turn = tokio::select! {
+        biased;
+        _ = session_over.cancelled() => None,
+        held = turn.acquire_owned() => held.ok(),
+    };
 
     loop {
         let command = tokio::select! {
