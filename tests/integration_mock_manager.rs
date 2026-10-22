@@ -23,6 +23,8 @@
 //! - a manager that stops reading → dropped at the write bound, not before;
 //!   shutdown stays prompt
 //! - more commands than the queue holds → answered `gateway_busy`
+//! - a Ping and a Close read together → a clean close, which resets the
+//!   reconnect backoff
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -538,6 +540,9 @@ enum Behaviour {
     PingButNeverRead,
     /// Read everything, send nothing.
     Quiet,
+    /// Send these frames in a single write, so the gateway reads them
+    /// together, then read until the gateway hangs up.
+    Burst { frames: Vec<Message> },
 }
 
 /// When things happened on a liveness mock, across all its connections.
@@ -654,6 +659,15 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
             }
             Behaviour::PingButNeverRead => (usize::MAX, PING_EVERY),
             Behaviour::Quiet => (0, PING_EVERY),
+            Behaviour::Burst { frames } => {
+                for frame in frames {
+                    if write.feed(frame).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = write.flush().await;
+                (0, PING_EVERY)
+            }
         };
         for _ in 0..pings {
             tokio::time::sleep(every).await;
@@ -704,20 +718,28 @@ fn command(id: &str, action: Value) -> Value {
     })
 }
 
-/// Start an SDK client with node credentials against `url`.
+type RunTask = tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkError>>;
+
+/// Start an SDK client with node credentials against `url`, reconnecting
+/// after 1 s whatever the attempt.
 async fn start_link_client(
     url: String,
     handler: Arc<SlowHandler>,
-) -> (
-    tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkError>>,
-    bilbycast_gateway_sdk::Emitter,
-    bilbycast_gateway_sdk::CancellationToken,
-) {
+) -> (RunTask, bilbycast_gateway_sdk::Emitter, bilbycast_gateway_sdk::CancellationToken) {
+    start_link_client_backing_off(url, handler, vec![1]).await
+}
+
+/// [`start_link_client`] with these reconnect backoff steps.
+async fn start_link_client_backing_off(
+    url: String,
+    handler: Arc<SlowHandler>,
+    steps_secs: Vec<u64>,
+) -> (RunTask, bilbycast_gateway_sdk::Emitter, bilbycast_gateway_sdk::CancellationToken) {
     enable_plaintext_ws();
     let mut cfg = test_config(url);
     cfg.node_id = Some("node-1".into());
     cfg.node_secret = Some("secret-1".into());
-    cfg.reconnect_backoff = bilbycast_gateway_sdk::ReconnectBackoff { steps_secs: vec![1] };
+    cfg.reconnect_backoff = bilbycast_gateway_sdk::ReconnectBackoff { steps_secs };
     let client = GatewayClient::connect(cfg, handler).await.unwrap();
     let emitter = client.emitter();
     let shutdown = client.shutdown_token();
@@ -747,10 +769,7 @@ async fn first_session_then_pause_the_clock(log: &LinkLog) {
 }
 
 /// Stop the client and check `run()` returns.
-async fn stop(
-    run_task: tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkError>>,
-    shutdown: bilbycast_gateway_sdk::CancellationToken,
-) {
+async fn stop(run_task: RunTask, shutdown: bilbycast_gateway_sdk::CancellationToken) {
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), run_task)
         .await
@@ -977,6 +996,32 @@ async fn a_full_command_queue_is_answered_busy() {
         .collect();
     assert_eq!(ran.len() + busy.len(), 100);
     assert!(ran.windows(2).all(|w| w[0] < w[1]), "queued commands ran out of order: {ran:?}");
+
+    stop(run_task, shutdown).await;
+}
+
+/// A Ping and a Close read together, as they are when they arrive back to
+/// back or while the session loop is held up in a write. The reader reads
+/// both before the loop gets to its Pong for the ping, and tungstenite
+/// refuses every write once it has read a Close. That refusal ended the
+/// session as lost rather than closed, which does not reset the reconnect
+/// backoff. Two such closes in a row: reset each time, the third session
+/// follows the second within a second; counted as losses, the second wait is
+/// the backoff's 60 s step.
+#[tokio::test]
+async fn a_close_read_behind_a_ping_is_a_clean_close() {
+    let ping_then_close = Behaviour::Burst {
+        frames: vec![Message::Ping(Vec::new().into()), Message::Close(None)],
+    };
+    let (url, log) = spawn_link_mock(vec![ping_then_close.clone(), ping_then_close]).await;
+    let (run_task, _emitter, shutdown) =
+        start_link_client_backing_off(url, Arc::new(SlowHandler::default()), vec![1, 60]).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(30), || log.auths().len() >= 3).await,
+        "a session the manager closed must reset the backoff, not count as lost"
+    );
 
     stop(run_task, shutdown).await;
 }

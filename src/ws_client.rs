@@ -53,6 +53,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
+use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Bytes, Message, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -1024,12 +1025,27 @@ async fn drive_session(
 }
 
 /// Write one frame, giving up after [`WRITE_STALL_LIMIT`].
+///
+/// A frame refused because the manager has closed the connection does not
+/// fail the session. The reader runs beside the writes, so it can read the
+/// manager's Close while a frame is still on its way here (the Pong for a
+/// ping read just before the Close, say), and tungstenite refuses every write
+/// from then on. The reader has handed that Close to the session loop behind
+/// whatever it read first, so the loop ends the session on it as a clean
+/// close. Failing here instead would log a clean close as a lost session and
+/// leave the reconnect backoff climbing.
 async fn send_bounded(
     write: &mut ManagerSink,
     message: Message,
     what: &str,
 ) -> Result<(), SdkError> {
     match tokio::time::timeout(WRITE_STALL_LIMIT, write.send(message)).await {
+        Ok(Err(WsError::Protocol(ProtocolError::SendAfterClosing))) => {
+            debug!(
+                "Gateway SDK: not writing a {what} frame: the manager has closed the connection"
+            );
+            Ok(())
+        }
         Ok(sent) => sent.map_err(SdkError::from),
         Err(_) => Err(SdkError::WebSocket(format!(
             "the manager stopped reading: a {what} frame could not be written in {}s",
