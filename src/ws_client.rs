@@ -560,14 +560,15 @@ impl GatewayClient {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_SIZE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_SIZE);
 
-        // Cancelled however this function returns, so the worker never starts
-        // a command for a session that has already ended.
+        // Cancelled as soon as the session ends, so the worker never starts a
+        // command for a session that has already ended. The guard covers this
+        // future being dropped part-way.
         let session_over = CancellationToken::new();
         let _session_over = session_over.clone().drop_guard();
         tokio::spawn(run_commands(
             self.command_turn.clone(),
             command_rx,
-            session_over,
+            session_over.clone(),
             self.handler.clone(),
             Emitter::new(self.outbound_tx.clone()),
         ));
@@ -596,6 +597,11 @@ impl GatewayClient {
                 &self.cfg.software_version,
             ) => end,
         };
+
+        // Now, not when this returns: the Close below can take its full 2 s,
+        // and a command that finished in the meantime would otherwise let the
+        // worker start the next one queued, for shutdown to wait on.
+        session_over.cancel();
 
         if let ConnectionResult::ShutdownRequested = end {
             info!("Gateway SDK: shutdown requested, closing WebSocket");

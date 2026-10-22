@@ -29,7 +29,8 @@
 //!   the next session, and that session's commands wait for it
 //! - reconnects behind a command that never returns → no pile-up of workers,
 //!   and the commands of the sessions that ended never run
-//! - shutdown while a command runs → `run()` waits for it, up to 30 s
+//! - shutdown while a command runs → `run()` waits for it, up to 30 s, and
+//!   starts nothing queued behind it
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -543,7 +544,8 @@ enum Behaviour {
     CommandsThenPing { commands: Vec<Value> },
     /// Never read again; ping every [`PING_EVERY`].
     PingButNeverRead,
-    /// Send these envelopes, then as [`Behaviour::PingButNeverRead`].
+    /// Send these envelopes in a single write, then as
+    /// [`Behaviour::PingButNeverRead`].
     CommandsThenStopReading { commands: Vec<Value> },
     /// Read everything, send nothing.
     Quiet,
@@ -662,12 +664,22 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
     let writer = async {
         let (pings, every) = match behaviour {
             Behaviour::PingThenSilent { count } => (count, Duration::from_secs(1)),
-            Behaviour::CommandsThenPing { commands }
-            | Behaviour::CommandsThenStopReading { commands } => {
+            Behaviour::CommandsThenPing { commands } => {
                 for command in commands {
                     if write.send(Message::Text(command.to_string().into())).await.is_err() {
                         return;
                     }
+                }
+                (usize::MAX, PING_EVERY)
+            }
+            Behaviour::CommandsThenStopReading { commands } => {
+                for command in commands {
+                    if write.feed(Message::Text(command.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+                if write.flush().await.is_err() {
+                    return;
                 }
                 (usize::MAX, PING_EVERY)
             }
@@ -1235,5 +1247,49 @@ async fn shutdown_gives_up_on_a_command_that_never_finishes() {
     assert!(
         (Duration::from_secs(30)..=Duration::from_secs(32)).contains(&waited),
         "run() returned {waited:?} after shutdown; it should wait 30 s for the running command"
+    );
+}
+
+/// Shutdown just before a running command finishes, with another queued
+/// behind it and a manager that has stopped reading, so writing the Close
+/// takes its whole 2 s. The session was marked over only once that write had
+/// given up, so the running command finished inside it and the worker
+/// started the queued one: a command shutdown then waited on, though no
+/// queued command may start once its session has ended.
+#[tokio::test]
+async fn no_queued_command_starts_while_the_close_is_written() {
+    // In one write, so the gateway routes both before it takes the stats
+    // frame below and its write sticks.
+    let commands = vec![
+        command("slow-1", json!({ "type": "slow", "secs": 60 })),
+        command("echo-2", json!({ "type": "echo" })),
+    ];
+    let (url, log) =
+        spawn_link_mock(vec![Behaviour::CommandsThenStopReading { commands }]).await;
+    let handler = Arc::new(LinkHandler::default());
+    let (run_task, emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || handler.started_at("slow-1").is_some()).await,
+        "the command should start"
+    );
+    let slow_started = handler.started_at("slow-1").unwrap();
+    // One frame larger than the socket buffers hold, so the session's write
+    // sticks without filling the outbound channel: the running command's ack
+    // must have room, or it alone would keep the worker from the next one.
+    emitter.emit_stats(json!({ "blob": "x".repeat(32 << 20) })).await.unwrap();
+
+    tokio::time::sleep_until(slow_started + Duration::from_millis(59_500)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(60), run_task)
+        .await
+        .expect("run() should return")
+        .unwrap()
+        .unwrap();
+    assert!(handler.finished_at("slow-1").is_some(), "the running command should finish");
+    assert_eq!(
+        handler.started(),
+        ["slow-1"],
+        "a command queued behind it started after shutdown was requested"
     );
 }
