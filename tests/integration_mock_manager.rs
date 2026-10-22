@@ -34,6 +34,8 @@
 //!   starts nothing queued behind it
 //! - a command read together with the manager's Close → dropped unrun, like
 //!   any command still queued when its session ends
+//! - a handler that panics → that command is acked `handler_panicked`, and
+//!   the next one runs
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -726,8 +728,9 @@ async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: L
 }
 
 /// The liveness tests' handler, which records when each command starts and
-/// finishes. A `slow` command sleeps for `action.secs` and a `hang` command
-/// waits for `release`; everything else succeeds at once.
+/// finishes. A `slow` command sleeps for `action.secs`, a `hang` command
+/// waits for `release` and a `panic` command panics; everything else
+/// succeeds at once.
 #[derive(Default)]
 struct LinkHandler {
     started: Mutex<Vec<(String, Instant)>>,
@@ -766,6 +769,7 @@ impl CommandHandler for LinkHandler {
                 tokio::time::sleep(Duration::from_secs(secs)).await;
             }
             Some("hang") => self.release.notified().await,
+            Some("panic") => panic!("the handler panics on {command_id}, as the test asked"),
             _ => {}
         }
         self.finished.lock().unwrap().push((command_id, Instant::now()));
@@ -1360,6 +1364,35 @@ async fn a_command_read_with_the_close_is_dropped_unrun() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(handler.started().is_empty(), "the command read with the Close ran");
     assert!(log.ack("echo-1").is_none(), "the command read with the Close was acked");
+
+    stop(run_task, shutdown).await;
+}
+
+/// A handler that panics on one command. The panic used to unwind out of
+/// `run()`; now it costs that command alone, which the manager hears about
+/// as `handler_panicked`, and the next command runs on the same session.
+#[tokio::test]
+async fn a_handler_panic_costs_one_command() {
+    let commands = vec![
+        command("panic-1", json!({ "type": "panic" })),
+        command("echo-2", json!({ "type": "echo" })),
+    ];
+    let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands }]).await;
+    let (run_task, _emitter, shutdown) =
+        start_link_client(url, Arc::new(LinkHandler::default())).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(10), || log.acks().len() >= 2).await,
+        "both commands must be answered, got {} acks",
+        log.acks().len()
+    );
+    let (_, panicked) = log.ack("panic-1").unwrap();
+    assert_eq!(panicked["success"], false);
+    assert_eq!(panicked["error_code"], "handler_panicked");
+    let (_, next) = log.ack("echo-2").unwrap();
+    assert_eq!(next["success"], true, "the command after the panic must run");
+    assert_eq!(log.auths().len(), 1, "a handler panic must not cost the session");
 
     stop(run_task, shutdown).await;
 }
