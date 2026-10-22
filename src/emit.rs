@@ -156,25 +156,8 @@ impl Emitter {
         command_id: &str,
         result: Result<Value, CommandError>,
     ) -> Result<(), SdkError> {
-        let mut payload = serde_json::Map::new();
-        payload.insert("command_id".into(), Value::String(command_id.into()));
-        match result {
-            Ok(data) => {
-                payload.insert("success".into(), Value::Bool(true));
-                if !matches!(data, Value::Null) {
-                    payload.insert("data".into(), data);
-                }
-            }
-            Err(err) => {
-                payload.insert("success".into(), Value::Bool(false));
-                payload.insert("error".into(), Value::String(err.message.clone()));
-                payload.insert("error_code".into(), Value::String(err.code.clone()));
-                if let Some(details) = err.details {
-                    payload.insert("details".into(), details);
-                }
-            }
-        }
-        self.send_envelope("command_ack", Value::Object(payload)).await
+        self.send_envelope("command_ack", command_ack_payload(command_id, result))
+            .await
     }
 
     /// Emit a `pong` in response to a manager `ping` envelope. The SDK read
@@ -182,4 +165,30 @@ impl Emitter {
     pub async fn emit_pong(&self) -> Result<(), SdkError> {
         self.send_envelope("pong", Value::Null).await
     }
+}
+
+/// The `command_ack` payload for one command's result. Shared with the
+/// session loop, which writes a refusal itself when the command queue is
+/// full: sending it through this channel instead would have the loop wait
+/// on a channel that only the loop drains.
+pub(crate) fn command_ack_payload(command_id: &str, result: Result<Value, CommandError>) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("command_id".into(), Value::String(command_id.into()));
+    match result {
+        Ok(data) => {
+            payload.insert("success".into(), Value::Bool(true));
+            if !matches!(data, Value::Null) {
+                payload.insert("data".into(), data);
+            }
+        }
+        Err(err) => {
+            payload.insert("success".into(), Value::Bool(false));
+            payload.insert("error".into(), Value::String(err.message));
+            payload.insert("error_code".into(), Value::String(err.code));
+            if let Some(details) = err.details {
+                payload.insert("details".into(), details);
+            }
+        }
+    }
+    Value::Object(payload)
 }

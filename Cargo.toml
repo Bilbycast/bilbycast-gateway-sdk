@@ -48,6 +48,9 @@ sigstore = { version = "0.14", default-features = false, features = ["sigstore-t
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# `test-util` for the paused clock: the manager-link tests exercise deadlines
+# of 30 s to 5 min, which on a paused clock take milliseconds.
+tokio = { version = "1.53.2", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"

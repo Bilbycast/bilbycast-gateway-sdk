@@ -13,6 +13,16 @@
 //! - Server closes the socket → SDK reconnects with persisted credentials
 //! - `get_config` command → SDK replies with `config_response` + ack
 //! - `ping` → `pong`
+//!
+//! And the manager-link liveness cases (see the section at the end):
+//! - a peer that never answers the upgrade → the dial gives up and retries
+//! - a manager that pings, then goes silent → the session is dropped and
+//!   redialled
+//! - a command longer than the silence limit → the session stays up, keeps
+//!   answering pings, and the ack arrives
+//! - a manager that stops reading → dropped at the write bound, not before;
+//!   shutdown stays prompt
+//! - more commands than the queue holds → answered `gateway_busy`
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,9 +34,12 @@ use bilbycast_gateway_sdk::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 struct RecordingHandler {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
@@ -493,4 +506,476 @@ async fn unknown_manager_message_type_is_ignored() {
             .any(|a| a["command_id"] == "after-unknown" && a["success"] == true),
         "SDK should have survived the unknown message type and processed the follow-up command"
     );
+}
+
+// ── Manager-link liveness ───────────────────────────────────────────────
+//
+// What stranded three edges offline in bilbycast-edge#180, this client had
+// too: a dial with no deadline, nothing watching a session that had gone
+// quiet, writes with no bound, and commands run inline in the session loop.
+//
+// The deadlines involved run from 30 s to five minutes, so each test moves
+// onto tokio's paused clock once its first connection is up: from then on the
+// clock jumps straight to the next timer whenever every task is waiting, and
+// a five-minute stall takes milliseconds. The loopback I/O stays real, so a
+// jump can land while a packet is in flight. The first connection is made on
+// the real clock for that reason, and after it `wait_until`'s 50 ms polling
+// keeps every jump that short, so no deadline expires early. (The dial test
+// has no poller, but asserts nothing finer than "it dialled again".)
+
+/// The mock manager's keepalive, as `ws_keepalive_interval_secs` would set it.
+const PING_EVERY: Duration = Duration::from_secs(5);
+
+/// What a liveness mock's connection does once the SDK has authenticated.
+#[derive(Clone)]
+enum Behaviour {
+    /// Ping `count` times, a second apart, then never send another frame —
+    /// while still reading everything the gateway sends.
+    PingThenSilent { count: usize },
+    /// Send these envelopes, then ping every [`PING_EVERY`].
+    CommandsThenPing { commands: Vec<Value> },
+    /// Never read again; ping every [`PING_EVERY`].
+    PingButNeverRead,
+    /// Read everything, send nothing.
+    Quiet,
+}
+
+/// When things happened on a liveness mock, across all its connections.
+#[derive(Clone, Default)]
+struct LinkLog {
+    auths: Arc<Mutex<Vec<Instant>>>,
+    pings: Arc<Mutex<Vec<Instant>>>,
+    pongs: Arc<Mutex<Vec<Instant>>>,
+    acks: Arc<Mutex<Vec<(Instant, Value)>>>,
+}
+
+impl LinkLog {
+    fn auths(&self) -> Vec<Instant> {
+        self.auths.lock().unwrap().clone()
+    }
+
+    fn acks(&self) -> Vec<(Instant, Value)> {
+        self.acks.lock().unwrap().clone()
+    }
+
+    fn ack(&self, command_id: &str) -> Option<(Instant, Value)> {
+        self.acks().into_iter().find(|(_, ack)| ack["command_id"] == command_id)
+    }
+
+    fn pongs_between(&self, from: Instant, to: Instant) -> usize {
+        self.pongs.lock().unwrap().iter().filter(|t| (from..=to).contains(*t)).count()
+    }
+}
+
+/// Spawn a mock manager that serves its N-th connection with the N-th
+/// behaviour, and [`Behaviour::Quiet`] once they run out.
+async fn spawn_link_mock(behaviours: Vec<Behaviour>) -> (String, LinkLog) {
+    // A small receive buffer, which accepted sockets inherit, so a connection
+    // that stops reading backs the gateway's writes up after a few megabytes
+    // rather than after however much the kernel would autotune to.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let url = format!("ws://{}/ws/node", listener.local_addr().unwrap());
+
+    let log = LinkLog::default();
+    let conn_log = log.clone();
+    tokio::spawn(async move {
+        let mut behaviours = behaviours.into_iter();
+        while let Ok((stream, _)) = listener.accept().await {
+            // Nagle off, or a ping sent while an earlier one is unacknowledged
+            // waits for the gateway's delayed ACK — which, when the gateway's
+            // own writes are stalled and it has nothing to piggyback on, runs
+            // on the kernel's real-time timer while the paused clock races
+            // past the silence limit.
+            stream.set_nodelay(true).unwrap();
+            let behaviour = behaviours.next().unwrap_or(Behaviour::Quiet);
+            let log = conn_log.clone();
+            tokio::spawn(async move {
+                if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                    serve_link(ws, behaviour, log).await;
+                }
+            });
+        }
+    });
+    (url, log)
+}
+
+async fn serve_link(ws: WebSocketStream<TcpStream>, behaviour: Behaviour, log: LinkLog) {
+    let (mut write, mut read) = ws.split();
+
+    let Some(Ok(Message::Text(auth))) = read.next().await else {
+        return;
+    };
+    let auth: Value = serde_json::from_str(&auth).unwrap();
+    let reply = if auth["payload"].get("registration_token").is_some() {
+        json!({
+            "type": "register_ack",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "payload": { "node_id": "node-1", "node_secret": "secret-1" },
+        })
+    } else {
+        json!({ "type": "auth_ok", "timestamp": chrono::Utc::now().to_rfc3339(), "payload": {} })
+    };
+    if write.send(Message::Text(reply.to_string().into())).await.is_err() {
+        return;
+    }
+    log.auths.lock().unwrap().push(Instant::now());
+
+    let reads = !matches!(behaviour, Behaviour::PingButNeverRead);
+    let reader = async {
+        if !reads {
+            return std::future::pending().await;
+        }
+        while let Some(Ok(message)) = read.next().await {
+            match message {
+                Message::Pong(_) => log.pongs.lock().unwrap().push(Instant::now()),
+                Message::Text(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap_or_default();
+                    if v["type"] == "command_ack" {
+                        log.acks.lock().unwrap().push((Instant::now(), v["payload"].clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    let writer = async {
+        let (pings, every) = match behaviour {
+            Behaviour::PingThenSilent { count } => (count, Duration::from_secs(1)),
+            Behaviour::CommandsThenPing { commands } => {
+                for command in commands {
+                    if write.send(Message::Text(command.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+                (usize::MAX, PING_EVERY)
+            }
+            Behaviour::PingButNeverRead => (usize::MAX, PING_EVERY),
+            Behaviour::Quiet => (0, PING_EVERY),
+        };
+        for _ in 0..pings {
+            tokio::time::sleep(every).await;
+            if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                return;
+            }
+            log.pings.lock().unwrap().push(Instant::now());
+        }
+        std::future::pending().await
+    };
+    // Until the gateway hangs up: the reader sees the end of the stream, or,
+    // on a connection that no longer reads, the writer's next ping fails.
+    tokio::select! {
+        () = reader => {}
+        () = writer => {}
+    }
+}
+
+/// A handler whose `slow` command sleeps for `action.secs`, recording when it
+/// ran; everything else succeeds at once.
+#[derive(Default)]
+struct SlowHandler {
+    ran: Mutex<Option<(Instant, Instant)>>,
+}
+
+#[async_trait]
+impl CommandHandler for SlowHandler {
+    async fn handle_command(
+        &self,
+        _command_id: String,
+        action: Value,
+    ) -> Result<Value, CommandError> {
+        if action["type"] == "slow" {
+            let started = Instant::now();
+            let secs = action["secs"].as_u64().unwrap_or(0);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            *self.ran.lock().unwrap() = Some((started, Instant::now()));
+        }
+        Ok(Value::Null)
+    }
+}
+
+fn command(id: &str, action: Value) -> Value {
+    json!({
+        "type": "command",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": { "command_id": id, "action": action },
+    })
+}
+
+/// Start an SDK client with node credentials against `url`.
+async fn start_link_client(
+    url: String,
+    handler: Arc<SlowHandler>,
+) -> (
+    tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkError>>,
+    bilbycast_gateway_sdk::Emitter,
+    bilbycast_gateway_sdk::CancellationToken,
+) {
+    enable_plaintext_ws();
+    let mut cfg = test_config(url);
+    cfg.node_id = Some("node-1".into());
+    cfg.node_secret = Some("secret-1".into());
+    cfg.reconnect_backoff = bilbycast_gateway_sdk::ReconnectBackoff { steps_secs: vec![1] };
+    let client = GatewayClient::connect(cfg, handler).await.unwrap();
+    let emitter = client.emitter();
+    let shutdown = client.shutdown_token();
+    (tokio::spawn(client.run()), emitter, shutdown)
+}
+
+/// Poll `cond` until it holds or `limit` passes, on whichever clock is
+/// running. Returns whether it held.
+async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cond()
+}
+
+/// Up to the first authenticated session on the real clock, then pause it.
+async fn first_session_then_pause_the_clock(log: &LinkLog) {
+    assert!(
+        wait_until(Duration::from_secs(10), || log.auths().len() == 1).await,
+        "the first session should authenticate"
+    );
+    tokio::time::pause();
+}
+
+/// Stop the client and check `run()` returns.
+async fn stop(
+    run_task: tokio::task::JoinHandle<Result<(), bilbycast_gateway_sdk::SdkError>>,
+    shutdown: bilbycast_gateway_sdk::CancellationToken,
+) {
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run_task)
+        .await
+        .expect("run() should return on shutdown")
+        .unwrap()
+        .unwrap();
+}
+
+/// The stall behind bilbycast-edge#180: the peer accepts the TCP connection,
+/// reads the upgrade request and never answers. The dial was raced only
+/// against shutdown, so `run()` sat there for ever and never dialled again.
+#[tokio::test]
+async fn a_dial_to_a_peer_that_never_answers_is_abandoned_and_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws/node", listener.local_addr().unwrap());
+    let (accepted_tx, mut accepted) = mpsc::unbounded_channel::<Instant>();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let _ = accepted_tx.send(Instant::now());
+            // Read the upgrade request, and whatever follows, and never write
+            // a byte back.
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+
+    let (run_task, _emitter, shutdown) =
+        start_link_client(url, Arc::new(SlowHandler::default())).await;
+
+    tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+        .await
+        .expect("the SDK should dial")
+        .unwrap();
+    tokio::time::pause();
+    // The 30 s dial deadline, then a 1 s backoff.
+    tokio::time::timeout(Duration::from_secs(120), accepted.recv())
+        .await
+        .expect("the SDK must give up on a peer that never answers and dial again, not hang")
+        .unwrap();
+
+    stop(run_task, shutdown).await;
+}
+
+/// A manager that pings and then goes quiet while still taking what the
+/// gateway writes: a wedged handler behind a live TCP connection. The
+/// heartbeat writes kept succeeding and nothing noticed the quiet, so the
+/// session stayed up for ever with nobody at the other end. Now it is taken
+/// for dead after four ping intervals, held to the 90 s floor, and redialled.
+#[tokio::test]
+async fn a_manager_that_goes_silent_is_dropped_and_redialled() {
+    let (url, log) = spawn_link_mock(vec![Behaviour::PingThenSilent { count: 2 }]).await;
+    let (run_task, _emitter, shutdown) =
+        start_link_client(url, Arc::new(SlowHandler::default())).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(300), || log.auths().len() >= 2).await,
+        "a silent manager must be dropped and redialled"
+    );
+    let last_ping = *log.pings.lock().unwrap().last().expect("the manager pinged");
+    let redialled = log.auths()[1];
+    let quiet_for = redialled - last_ping;
+    assert!(
+        quiet_for >= Duration::from_secs(90),
+        "dropped {quiet_for:?} after the last ping, inside the 90 s floor"
+    );
+    assert!(
+        quiet_for <= Duration::from_secs(120),
+        "dropped {quiet_for:?} after the last ping; the floor is 90 s and checks run every 5 s"
+    );
+
+    stop(run_task, shutdown).await;
+}
+
+/// A command that runs longer than the silence limit — an `upgrade_binary`
+/// fetching a tarball, say — while the manager keeps pinging and the vendor
+/// keeps emitting.
+///
+/// The handler used to run inline in the session loop. For the whole command
+/// the manager's pings sat unread, so to the manager the gateway had gone
+/// quiet; and once the vendor's frames filled the outbound channel the
+/// command's own ack waited on a channel only that parked loop drains, so the
+/// session deadlocked. Now the reader answers the pings while the command
+/// runs, the session stays up, and the ack arrives.
+#[tokio::test]
+async fn a_long_command_neither_silences_nor_wedges_the_session() {
+    let slow = command("slow-1", json!({ "type": "slow", "secs": 150 }));
+    let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands: vec![slow] }]).await;
+    let handler = Arc::new(SlowHandler::default());
+    let (run_task, emitter, shutdown) = start_link_client(url, handler.clone()).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    // Appear X keeps emitting whether or not anyone is draining the channel.
+    let vendor = tokio::spawn(async move {
+        while emitter.emit_stats(json!({ "tick": true })).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    assert!(
+        wait_until(Duration::from_secs(400), || log.ack("slow-1").is_some()).await,
+        "the long command's ack must arrive"
+    );
+    let (started, finished) = handler.ran.lock().unwrap().expect("the command ran");
+    let answered = log.pongs_between(started, finished);
+    assert!(
+        answered >= 20,
+        "only {answered} pongs while a 150 s command ran under a {PING_EVERY:?} keepalive: \
+         the gateway stopped reading"
+    );
+    assert_eq!(log.auths().len(), 1, "the session must stay up through the command");
+
+    vendor.abort();
+    stop(run_task, shutdown).await;
+}
+
+/// Emit 32 MiB, several times what the socket buffers hold, so that against a
+/// manager that has stopped reading a write stalls.
+///
+/// A fixed amount rather than a stream: the paused clock moves only when
+/// every task is waiting, and a flood that never ends would keep the next
+/// session busy draining it for ever, with time standing still.
+fn flood(emitter: bilbycast_gateway_sdk::Emitter) -> tokio::task::JoinHandle<()> {
+    let blob = "x".repeat(64 * 1024);
+    tokio::spawn(async move {
+        for _ in 0..512 {
+            if emitter.emit_stats(json!({ "blob": blob })).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// A manager that stops reading but keeps pinging — a proxy holding the
+/// connection with its upstream stalled. The gateway's writes back up, and
+/// they back up inside the session loop, so a watchdog stamped from that loop
+/// would see silence at 90 s and flap a session whose manager is plainly
+/// there. The reader still hears the pings, so the session stays up until
+/// the 300 s write bound decides the manager has stopped draining, and is
+/// redialled then. Without the bound the write waited for ever.
+#[tokio::test]
+async fn a_manager_that_stops_reading_is_dropped_at_the_write_bound_not_before() {
+    let (url, log) = spawn_link_mock(vec![Behaviour::PingButNeverRead]).await;
+    let (run_task, emitter, shutdown) =
+        start_link_client(url, Arc::new(SlowHandler::default())).await;
+    let vendor = flood(emitter);
+    first_session_then_pause_the_clock(&log).await;
+    let session_up = log.auths()[0];
+
+    assert!(
+        wait_until(Duration::from_secs(500), || log.auths().len() >= 2).await,
+        "a session whose writes have stalled must end at the write bound"
+    );
+    let lasted = log.auths()[1] - session_up;
+    assert!(
+        lasted >= Duration::from_secs(250),
+        "the session ended after {lasted:?}, though the manager was still pinging: \
+         only the 300 s write bound should end it"
+    );
+    assert!(lasted <= Duration::from_secs(400), "the session lasted {lasted:?}");
+
+    vendor.abort();
+    stop(run_task, shutdown).await;
+}
+
+/// Shutdown while a write is stuck. Shutdown used to be one branch of the
+/// session loop's `select!`, which a write that never completes stops the
+/// loop from ever reaching: SIGTERM then waited for systemd's SIGKILL.
+#[tokio::test]
+async fn shutdown_is_prompt_while_the_manager_is_not_reading() {
+    let (url, log) = spawn_link_mock(vec![Behaviour::PingButNeverRead]).await;
+    let (run_task, emitter, shutdown) =
+        start_link_client(url, Arc::new(SlowHandler::default())).await;
+    let vendor = flood(emitter);
+    first_session_then_pause_the_clock(&log).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run_task)
+        .await
+        .expect("run() must return within the 2 s Close bound, not wait on the stuck write")
+        .unwrap()
+        .unwrap();
+    vendor.abort();
+}
+
+/// More commands than the queue holds while one runs: every command past the
+/// queue is refused at once with `gateway_busy`, so the manager hears "not
+/// run" rather than timing out on it, and the queued ones still run, in
+/// order, once the long one finishes. None goes unanswered.
+#[tokio::test]
+async fn a_full_command_queue_is_answered_busy() {
+    let mut commands = vec![command("slow-1", json!({ "type": "slow", "secs": 100 }))];
+    commands.extend((0..100).map(|n| command(&format!("echo-{n}"), json!({ "type": "echo" }))));
+    let (url, log) = spawn_link_mock(vec![Behaviour::CommandsThenPing { commands }]).await;
+    let (run_task, _emitter, shutdown) =
+        start_link_client(url, Arc::new(SlowHandler::default())).await;
+    first_session_then_pause_the_clock(&log).await;
+
+    assert!(
+        wait_until(Duration::from_secs(400), || log.acks().len() >= 101).await,
+        "every command must be answered, got {} acks",
+        log.acks().len()
+    );
+    let acks = log.acks();
+    assert_eq!(acks.len(), 101, "one ack per command");
+    let (slow_done, slow) = log.ack("slow-1").unwrap();
+    assert_eq!(slow["success"], true);
+
+    let busy: Vec<_> = acks.iter().filter(|(_, a)| a["error_code"] == "gateway_busy").collect();
+    assert!(!busy.is_empty(), "the commands past the queue must be refused as busy");
+    assert!(
+        busy.iter().all(|(at, _)| *at < slow_done),
+        "a busy refusal must come at once, not after the running command"
+    );
+
+    let ran: Vec<u32> = acks
+        .iter()
+        .filter(|(_, a)| a["success"] == true && a["command_id"] != "slow-1")
+        .map(|(_, a)| a["command_id"].as_str().unwrap()["echo-".len()..].parse().unwrap())
+        .collect();
+    assert_eq!(ran.len() + busy.len(), 100);
+    assert!(ran.windows(2).all(|w| w[0] < w[1]), "queued commands ran out of order: {ran:?}");
+
+    stop(run_task, shutdown).await;
 }
