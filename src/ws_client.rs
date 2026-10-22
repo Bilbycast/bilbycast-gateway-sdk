@@ -178,9 +178,9 @@ const PANICKED_ERROR_CODE: &str = "handler_panicked";
 /// reading while the session loop is held up in a write and commands wait
 /// behind the one running, so those queues are bounded in bytes as well as
 /// in count. At most [`INBOUND_BUDGET_BYTES`] of frames wait for the loop and
-/// [`COMMAND_QUEUE_BYTES`] of commands for the worker, besides one frame in
-/// the reader's hands and one in tungstenite's buffer, and the frame being
-/// routed and the command running, each of those two parsed.
+/// [`COMMAND_QUEUE_BYTES`] of commands for the worker. Besides those there
+/// is one frame in the reader's hands and one in tungstenite's buffer, the
+/// parse of the frame the loop is routing, and the command running, parsed.
 ///
 /// `tokio-tungstenite`'s default is 64 MiB / 16 MiB (message / frame),
 /// which is well above anything legitimate WS traffic produces here.
@@ -952,11 +952,11 @@ enum Inbound {
 /// was read after it, but routing is not running: the worker starts nothing
 /// for a session that has ended (see [`run_commands`]), so a command read in
 /// the same burst as the end is dropped unrun. A text frame waits for its
-/// share of `budget` first, so a loop held up in a write holds
-/// up the reading once that many bytes are waiting for it, rather than once
-/// the channel's count is. Returns only when the manager has been silent past
-/// its limit, as `(silent, limit)`. Every other end of the session is the
-/// loop's to report, so once it has been handed one, this parks.
+/// share of `budget` first, so a loop held up in a write holds up the reading
+/// once that many bytes are waiting for it, rather than once the channel's
+/// count is. Returns only when the manager has been silent past its limit, as
+/// `(silent, limit)`. Every other end of the session is the loop's to report,
+/// so once it has been handed one, this parks.
 async fn read_manager<S>(
     mut read: S,
     inbound: mpsc::Sender<Inbound>,
